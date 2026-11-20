@@ -1,0 +1,5462 @@
+{==============================================================================}
+{                                                                              }
+{  LosTextEditor.text  --  program LosTextEditor                               }
+{                                                                              }
+{  A plain-text editor that runs as a tool under the Lisa Office System       }
+{  (LOS 3.1).  It edits Lisa Workshop text files (.TEXT).  See README.md for  }
+{  the user guide and TECHNICAL.md for a description of this code.            }
+{                                                                              }
+{  THE OFFICE SYSTEM SIDE                                                      }
+{    - the Filer launches us; InitGraf + OpenWM + Initialize;                  }
+{    - the Filer lends us a window with an fcNone filer event, and            }
+{      InitNewDoc takes it with TakeWindow();                                  }
+{    - the two-phase event loop (blocked GetEvent while inactive, polling      }
+{      plus LetOthersRun while active);                                        }
+{    - menus come from a phrase file (InitMP), built by the Alert tool;        }
+{    - Filer commands are answered with TellFiler; fcTerminate ends the loop; }
+{    - the SYS_TERMINATE handler calls ImDying FIRST.                          }
+{                                                                              }
+{  THE EDITOR SIDE                                                             }
+{    - the text is a chain of 1K pages in a heap zone of its own (the Store), }
+{      lines ending in CR, addressed by line/column Places;                    }
+{    - selection, typing, Cut/Copy/Paste (private clipboard), one-level Undo  }
+{      with Redo, Shift Left/Right, Find and Find & Paste All, Go to Line,     }
+{      named markers, line numbers, the Type Style menu, printing;             }
+{    - all drawing is QuickDraw (DrawText, InvertRect, ScrollRect,             }
+{      EraseRect, MoveTo/Line ...) into the window the Filer lent us.          }
+{                                                                              }
+{  THE "DOCUMENT".  This is a TOOL (InstallTool question 4 answered N): the    }
+{  Filer gives us one window.  The text in it is kept in a data segment       }
+{  ("<tool prefix>work text") whenever the window is set aside, put away or   }
+{  the process is told to terminate, and brought back on the next launch      }
+{  when it holds unsaved work.  The File menu opens, saves and reverts        }
+{  Workshop .TEXT files, including their 1K header page (tabs, type style,    }
+{  scroll position, selection, markers).                                       }
+{                                                                              }
+{  BUILD:  <LosTextEditorMake  (LosTextEditorMake.text) -- compiles, links,   }
+{  installs the program, its phrase file LosTextEditorAlerts.text and its     }
+{  icon ICON.BIN, and runs InstallTool.                                        }
+{                                                                              }
+{  NOTE ON NAMES: Lisa Pascal only compares the first 8 characters of an       }
+{  identifier, so every identifier here is unique in its first 8 (check with  }
+{  audit_8char.py).                                                            }
+{                                                                              }
+{==============================================================================}
+
+program LosTextEditor;
+
+uses (*$U UnitStd.obj *)        UnitStd,     { base types, CMin/CMax        }
+     (*$U UnitHz.obj *)         UnitHz,      { heap zones: the text Store   }
+     (*$U Storage.obj *)        Storage,     { InitHeap, theHeap            }
+     (*$U QuickDraw.obj *)      QuickDraw,   { ALL drawing                  }
+     (*$U Fontmgr.obj *)        FontMgr,     { font families and metrics    }
+     (*$U SysCall.obj *)        SysCall,     { data segments, processes     }
+     (*$U PMDecl.obj *)         PMDecl,      { printer ids: declarations    }
+     (*$U PrStdInfo.obj *)      PrStdInfo,   { TPrRec, TPrPort; also needed }
+                                             { ahead of FilerComm           }
+     (*$U PrPublic.obj *)       PrPublic,    { the Print Manager: PrMgrInit,}
+                                             { the dialogs, PrDocStart ...  }
+     (*$U wm.events.obj *)      Events,      { GetEvent, ImActive, Time ... }
+     (*$U wm.folders.obj *)     Folders,     { OpenWM, TakeWindow, TakeControl }
+     (*$U wm.menus.obj *)       Menus,       { MenuSelect, MenuKey, CheckItem }
+     (*$U AlertMgr.obj *)       AlertMgr,    { InitMP: menus from the phrase file }
+     (*$U WMLstd.obj *)         WMLstd,      { window-library declarations  }
+     (*$U WMLgrow.obj *)        WMLgrow,     { the grow box (size control)  }
+     (*$U WMLsb.obj *)          WMLsb,       { the scroll bars              }
+     (*$U WMlCrs.obj *)         WMLCrs,      { cursors: I-beam / arrow      }
+     (*$U FilerComm.obj *)      FilerComm;   { TellFiler, DoFilingCmd ...   }
+
+{$R- }   { no range checks: the page arithmetic relies on it }
+{$D- }
+
+const
+   {------------------------------------------------------------- pages ---}
+   maxwidth = 255;      { max # of chars in a line                   }
+   pagemax = 1023;      { max indx into the page buffer              }
+   pagemin = 0;         { min indx into the page buffer              }
+   pageblks = 2;        { equiv num of blks to pagemax               }
+   IOpages = 4;         { num of pages for read/write                }
+   minblink = 1;        { minimum # of ticks for caret               }
+   tophysteresis = 50;  { hysteresis for grow up                     }
+   bothysteresis = 30;  { hysteresis for grow down                   }
+
+   HeaderVersion = 51;  { first .TEXT header version accepted          }
+   EditorVersion = 57;  { header version we write                      }
+   MarkerVersion = 57;  { first header version that holds markers       }
+   MarkerMax = 18;      { markers per text (the .TEXT header's room)    }
+   MarkStrLen = 14;
+
+   OutOfMem = 'not enough room left in memory';
+   FileNotFound = 948;  { OS error: no such file }
+
+   bs = chr(8);
+   cr = chr(13);        { new line with auto-indent        }
+   tab = chr(9);
+   dle = chr(16);       { blank compression in .TEXT files }
+   nul = chr(0);
+   EnterCh = chr(3);    { new line without auto-indent     }
+   ClearCh = chr(27);   { <Escape>/<Clear>: cancels a prompt }
+   LeftCh = chr(28);
+   RightCh = chr(29);
+   UpCh = chr(30);
+   DownCh = chr(31);
+   CmdChrs = [LeftCh, RightCh, UpCh, DownCh];
+   alphanum = ['0'..'9', 'A'..'Z', 'a'..'z', '_', '$'];
+
+   { Type Style menu items: style + size, item number = value }
+   FModern      = 1;
+   FClassic     = 2;
+   F8Pt20Pitch  = 4;    { p20tile           8 point 20 pitch }
+   F8Pt15Pitch  = 5;    { p15tile           8 point 15 pitch }
+   F10Pt12Pitch = 6;    { p12tile/p12cent  10 point 12 pitch }
+   F12Pt10Pitch = 7;    { p10tile/p10cent  12 point 10 pitch }
+   F12PtPS      = 8;    { tile12/cent12    12 point proportional }
+   F18PtPS      = 9;    { tile18/cent18    18 point proportional }
+                        { (the largest fixed-width fonts are 10 pitch; the  }
+                        { Lisa's bigger sizes are all proportional)         }
+   MainFStyle = FModern;
+   MainFSize  = F10Pt12Pitch;
+
+   {--------------------------------------------------------------- LOS ---}
+   workLDSN  = 2;       { LDSN for the saved-text segment (opened briefly) }
+   storeLDSN = 3;       { LDSN for the text Store heap zone segment        }
+   StoreSize = $00008000; { initial size of the Store: 32K.  EIGHT hex     }
+                        { digits: $8000 would be the 16-bit integer -32768 }
+   WorkingSet = 90000;  { swap space to keep free when growing the Store   }
+   maxHeap = 10000;     { our private heap, in integers (20K bytes)        }
+   WorkVersion = 2;     { version stamp of the saved-text segment          }
+                        { (2: markers were added)                           }
+
+   alertVerNum = 3;     { must match line 1 of LosTextEditorAlerts.text    }
+                        { (2: Print menu; 3: Markers menu)                  }
+   printLDSN = 1;       { LDSN PrDocStart maps its spool segment through   }
+                        { (the Print Manager itself uses 9 and 12, the     }
+                        { Window Manager 15)                                }
+
+   { Menus: ids and item positions MUST match LosTextEditorAlerts.text.   }
+   { A '-' separator line counts as an item.                              }
+   mFile = 1;
+      miAsdAll   = 1;    { Set Aside Everything }
+      miAside    = 2;    { Set Aside "Text Editor" }
+      miPutAway  = 4;    { Save & Put Away }
+      miNewText  = 6;    { New (Empty) Text }
+      miOpenText = 7;    { Open Text File ... }
+      miSaveText = 8;    { Save Text File }
+      miSaveAs   = 9;    { Save Text File As ... }
+      miRevert   = 10;   { Revert to Saved Text File }
+      miExit     = 12;   { Exit Editor (Apple-Q): same as Save & Put Away }
+   mEdit = 2;
+      miUndo     = 1;
+      miCut      = 3;
+      miCopy     = 4;
+      miPaste    = 5;
+      miShLeft   = 7;
+      miShRight  = 8;
+      miTabs     = 10;
+      miSelAll   = 12;
+      miLineNums = 14;   { Show Line Numbers (check-marked toggle) }
+   mSearch = 3;
+      miFind     = 1;
+      miFindSame = 2;
+      miFindAll  = 3;
+      miWords    = 5;
+      miCase     = 6;
+      miWrap     = 7;
+      miGoTo     = 9;
+      miShowIns  = 10;
+   mStyle = 4;           { items = FModern .. F18PtPS above }
+   mPrint = 5;
+      miFormat   = 1;    { Format for Printer ... }
+      miPrint    = 2;    { Print ...              }
+      miPrSel    = 3;    { Print Selection ...    }
+      miMonitor  = 5;    { Monitor the Printer ...}
+   mMarkers = 6;
+      miSetMark  = 1;    { Set Marker ...     }
+      miDelMark  = 2;    { Delete Marker ...  }
+      miGoMark   = 4;    { Go to Marker ...   }
+   lastMenu = 6;
+
+type
+   phyle = file;
+   Str30 = string[30];
+   str = string[maxwidth];
+   FileStr = str;   { the SAME type as str (not a second string[255]), so a }
+                    { FileStr can be passed to a "var s: str" parameter     }
+
+   { the text: a chain of 1K pages }
+   PageBuf = packed array [PageMin .. PageMax] of Char;
+   PagePtr = ^page;
+   page = record
+             prvpage, nxtpage: PagePtr;
+             linesinp: integer;
+             Sparse: Boolean;
+             p: PageBuf;
+          end;
+
+   Place = record
+              case Boolean of
+                 true:  (Ln: integer;
+                         Ch: integer);
+                 false: (LnCh: LongInt)
+           end;
+
+   Range = record
+              Left: Place;
+              Right: Place;
+           end;
+
+   { A named marker: a remembered selection (also the layout in the    }
+   { .TEXT header)                                                     }
+   MarkStr = string[MarkStrLen];
+   TMark = record
+               name: MarkStr;
+               p: Range;
+           end;
+
+   { The document }
+   DocDefn = record
+                DocPosn: integer;   { first visible line              }
+                ElevPosn: integer;  { in thousandths of shaft         }
+                FileName: FileStr;  { the .TEXT file, if any          }
+                HasFile: Boolean;   { FileName is meaningful          }
+                HeadList: PagePtr;  { header page, then text pages    }
+                Select: Range;      { current selection               }
+                LinesVis: integer;  { number of lines currently visible }
+                LinesTot: integer;  { number of CR-terminated lines   }
+                Changed: Boolean;   { differs from the .TEXT file     }
+                FontId: TLFntId;    { current font Id                 }
+                FontStyle: integer; { FModern..FClassic               }
+                FontSize: integer;  { F8Pt20Pitch..F18PtPS            }
+                VertSp: integer;    { vertical spacing                }
+                HorzSp: integer;    { horizontal spacing              }
+                Above: integer;     { vertical offset                 }
+                Below: integer;     { vertical offset                 }
+                Before: integer;    { horizontal offset               }
+                After: integer;     { inversion offset                }
+                SpaceW: integer;    { width of space char             }
+                TabsIncr: integer;  { tab setting (spaces per tab)    }
+                NumMarkers: integer;                  { markers in use }
+                Markers: array [1..MarkerMax] of TMark;
+             end;
+
+   span = (single, double, triple, beyond);
+
+   Cmds = (CmdNone, CmdAbort, CmdActivate, CmdDeactivate, CmdSelect, CmdType,
+           CmdFile, CmdUndo, CmdCut, CmdCopy, CmdPaste, CmdSelAll,
+           CmdAdjLeft, CmdAdjRight, CmdTabs,
+           CmdFind, CmdFindSame, CmdFindAll, CmdToken, CmdCase, CmdWrap,
+           CmdGoTo, CmdCurrent, CmdFStyle, CmdFSize, CmdScroll, CmdGrow);
+
+   CmdInfo = record { Undo info }
+                Cmd: Cmds; { last command performed }
+                Undoable: Boolean;
+                case Data: Cmds of
+                   CmdNone, CmdAbort, CmdActivate, CmdDeactivate, CmdSelect,
+                   CmdFile, CmdUndo, CmdAdjLeft, CmdAdjRight, CmdFindAll,
+                   CmdToken, CmdCase, CmdWrap, CmdScroll, CmdGrow:
+                      ();
+                   CmdCurrent: (DocPosn: integer);
+                   CmdFSize:   (FontSize: integer);
+                   CmdFStyle:  (FontStyle: integer);
+                   CmdFind, CmdFindSame: (Start: Range; Target: str);
+                   CmdTabs:    (TabsIncr: integer);
+                   CmdGoTo:    (GoSel: Range; GoPosn: integer);
+                   CmdSelAll, CmdType, CmdCut, CmdCopy, CmdPaste:
+                      (List: PagePtr; Select: Range);
+             end;
+
+   { The header in page 0 of a Workshop .TEXT file }
+   Header = record
+               Version: integer;
+               FontId: TLFntId;
+               Dummy1: integer;
+               FontName: Str30;
+               TabsIncr: integer;
+               LMargin: integer;
+               RMargin: integer;
+               ParaMargin: integer;
+               CmdChar: Char;
+               DocPosn: integer;
+               ElevPosn: integer;
+               Select: Range;
+               Dirty: Boolean;
+               TimeWritten: LongInt;
+               NumMarkers: integer;
+               Markers: array [1..MarkerMax] of TMark;
+            end;
+
+   { The saved-text data segment: this header, then TextLen characters }
+   { (lines separated by CR).                                          }
+   WorkHdr = record
+                Version: integer;
+                HasFile: Boolean;
+                Changed: Boolean;
+                FileName: string[100];
+                Select: Range;
+                DocPosn: integer;
+                TabsIncr: integer;
+                FontStyle: integer;
+                FontSize: integer;
+                NumMarkers: integer;
+                Markers: array [1..MarkerMax] of TMark;
+                TextLen: LongInt;
+             end;
+   WorkHdrPtr = ^WorkHdr;
+   CharPtr = ^char;
+   PageBufPtr = ^PageBuf;
+
+var
+   {--------------------------------------------------- LOS application ---}
+   theEvent  : EventRecord;   { the event most recently taken from the WM }
+   myWindow  : WindowPtr;     { the window the Filer lent us (nil = none)  }
+   toldToDie : boolean;       { set by fcTerminate: ends the main loop     }
+   initing   : boolean;       { true while Initialize runs                 }
+   myMenus   : array [1..lastMenu] of MenuInfo;
+   allAlerts : TAlertFile;    { the phrase file (menus + required alerts)  }
+   myZone    : array [0..maxHeap] of integer;  { our private heap          }
+   myPrefix  : TParamAlert;   { "<stem>-(Tnnn)", from our own path         }
+   workPath  : pathname;      { the saved-text data segment                }
+   storePath : pathname;      { the Store's (scratch) data segment         }
+   ioNest    : integer;       { BeginIO/EndIO nesting                      }
+   schedErr  : integer;
+
+   {------------------------------------------------------------- editor ---}
+   DeskStyle: TLFntId;        { desk font for the dialog band        }
+   BoxHeight: integer;        { Dialog box height                    }
+   BoxHOffset,
+   BoxVOffset: integer;       { Offset to text within dialog box     }
+
+   theFolder: WindowPtr;      { the port we are drawing into         }
+   The: DocDefn;              { the one document                     }
+   DocSBList: TSBList;        { its scroll bars                      }
+   RightSBox: THSB;
+   SBMade: boolean;
+
+   Store: THz;                { repository for document text pages   }
+   StoreRefNum: integer;
+
+   scraplist, insertpg: PagePtr;
+
+   IsCaretVis: Boolean;       { caret info for the active document   }
+   IsActive: Boolean;         { our window is the active window      }
+
+   Target: str;               { Search target string                 }
+   TokenMode: Boolean;        { Search parameters                    }
+   MatchCase: Boolean;
+   WrapSearch: boolean;
+
+   blnktyme, seltyme: LongInt;
+   targsize: span;
+   Last: CmdInfo;
+
+   UpDelay, DownDelay: LongInt;
+   UpTime, DownTime: LongInt;
+   UpWhere, DownWhere: Point;
+
+   CacheLn: integer;          { Used by GenLine for optimization     }
+   CacheLine: str;
+   DummyRgn: RgnHandle;
+   PromptPt: point;           { separates prompt and default in dialog }
+   ClickOut: boolean;
+
+   ShowNums: boolean;         { draw line numbers in a left margin       }
+   MarginW: integer;          { its width (0 when off): the text area    }
+                              { starts this much further right           }
+   DigitW: integer;           { width of a digit in the text's font      }
+
+   OrigTitle: str255;         { the window title the Filer gave us       }
+   ShownTitle: str255;        { the title we last set                    }
+   StatusRect: Rect;          { the bottom bar: "Line n, Column m"       }
+   StatusOK: boolean;         { StatusRect is valid and on screen        }
+   StatusSel: Range;          { the selection the status line shows      }
+   prRec: TPrRec;             { the print record: printer, paper, ...    }
+   PendingOpen: boolean;      { ask "Open text file named ?" when idle   }
+
+
+{==============================================================================}
+{  Small helpers: numbers, strings, the preemption bracket                     }
+{==============================================================================}
+
+{$S LTEUtil }
+
+procedure NumToStr(n: integer; var s: str);
+var divisor, d: integer;
+    started: boolean;
+begin
+   s := '';
+   if n < 0 then begin
+      s := '-';
+      n := - n
+   end;
+   divisor := 10000;
+   started := false;
+   while divisor > 0 do begin
+      d := (n div divisor) mod 10;
+      if (d <> 0) or started or (divisor = 1) then begin
+         s := concat(s, ' ');
+         s[length(s)] := chr(ord('0') + d);
+         started := true
+      end;
+      divisor := divisor div 10
+   end
+end;
+
+function StrToNum(var s: str; var n: integer): boolean;
+var i: integer;
+    acc: LongInt;
+    any: boolean;
+begin
+   StrToNum := false;
+   acc := 0;
+   any := false;
+   for i := 1 to length(s) do
+      if s[i] in ['0'..'9'] then begin
+         acc := acc * 10 + (ord(s[i]) - ord('0'));
+         if acc > 32767 then exit(StrToNum);
+         any := true
+      end
+      else if s[i] <> ' ' then exit(StrToNum);
+   if any then begin
+      n := acc;
+      StrToNum := true
+   end
+end;
+
+procedure UpStr(var s: str);
+var i: integer;
+begin
+   for i := 1 to length(s) do
+      if (s[i] >= 'a') and (s[i] <= 'z') then s[i] := chr(ord(s[i]) - 32)
+end;
+
+procedure TrimStr(var s: str);
+begin
+   while length(s) > 0 do
+      if s[1] = ' ' then delete(s, 1, 1)
+      else if s[length(s)] = ' ' then delete(s, length(s), 1)
+      else exit(TrimStr)
+end;
+
+{ A process launched by the Window Manager runs NON-preemptive.  Any OS call }
+{ that can block on the disk must be bracketed by Sched_Class(false) ...    }
+{ Sched_Class(true) so the OS can service the block.                         }
+procedure BeginIO;
+begin
+   if ioNest = 0 then Sched_Class(schedErr, false);
+   ioNest := ioNest + 1
+end;
+
+procedure EndIO;
+begin
+   ioNest := ioNest - 1;
+   if ioNest = 0 then Sched_Class(schedErr, true)
+end;
+
+{$S }
+
+{==============================================================================}
+{  Heap-zone growth for the text Store                                        }
+{==============================================================================}
+
+{$S LTEErr }
+
+function GrowHeap(Hz: THz;               { heap zone which ran out of space }
+                  BytesNeeded: integer;  { # additional bytes needed        }
+                  MemExtra: LongInt;     { extra memory to try for          }
+                  DiscExtra: LongInt;    { extra disc to try for            }
+                  SwapNeeded: LongInt;   { swap space to keep free          }
+                  var ErrNum: integer)
+                  : integer;             { # additional bytes given to zone }
+var
+   Result: integer;
+
+   procedure TryGrow;
+   var
+      DSRefNum: integer;
+      Increment: LongInt;
+      CurHzSize: LongInt;
+      MemNeeded, DiscNeeded: LongInt;
+      MemRequest, DiscRequest: LongInt;
+      NewMSize, NewDSize: LongInt;
+      SwapAvail, DataUsed, CurCode, MaxCode: LongInt;
+      DSInfo: DSInfoRec;
+   begin
+      Info_Address(ErrNum, Ord(Hz), DSRefNum);
+      if ErrNum <> 0 then Exit(TryGrow);
+      Info_DataSeg(ErrNum, DSRefNum, DSInfo);
+      if ErrNum <> 0 then Exit(TryGrow);
+
+      CurHzSize := CBofHz(Hz);
+      MemNeeded := (CurHzSize + BytesNeeded) - DSInfo.Mem_Size;
+      if MemNeeded <= 0 then begin
+         Increment := DSInfo.Mem_Size - CurHzSize;
+         if Increment > maxint then Increment := maxint;
+         Result := Increment;
+         Exit(TryGrow);
+      end;
+
+      MemRequest := MemNeeded + MemExtra;
+      if MemRequest > maxint then MemRequest := maxint;
+
+      Mem_Info(ErrNum, SwapAvail, DataUsed, CurCode, MaxCode);
+      if ErrNum <> 0 then Exit(TryGrow);
+      if (SwapAvail - MemRequest) < SwapNeeded then begin
+         MemRequest := SwapAvail - SwapNeeded;
+         if MemRequest <= 0 then Exit(TryGrow);
+         if MemNeeded > MemRequest then MemNeeded := MemRequest;
+      end;
+
+      DiscNeeded := (CurHzSize + BytesNeeded) - DSInfo.Disc_Size;
+      if DiscNeeded <= 0 then begin
+         if MemRequest > DSInfo.Disc_Size - DSInfo.Mem_Size then
+            MemRequest := DSInfo.Disc_Size - DSInfo.Mem_Size;
+         DiscNeeded := 0;
+         DiscRequest := 0;
+      end
+      else DiscRequest := DiscNeeded + DiscExtra;
+
+      Size_DataSeg(ErrNum, DSRefNum, MemRequest, NewMSize, DiscRequest, NewDSize);
+      if (ErrNum <> 0) and (MemRequest > MemNeeded) then
+         Size_DataSeg(ErrNum, DSRefNum, MemNeeded, NewMSize, DiscRequest, NewDSize);
+      if (ErrNum <> 0) and (DiscRequest > DiscNeeded) then
+         Size_DataSeg(ErrNum, DSRefNum, MemNeeded, NewMSize, DiscNeeded, NewDSize);
+
+      if ErrNum = 0 then begin
+         Increment := NewMSize - CurHzSize;
+         if Increment > maxint then Increment := maxint;
+         Result := Increment;
+      end;
+   end; { TryGrow }
+
+begin
+   Result := 0;
+   ErrNum := 0;
+   BeginIO;
+   TryGrow;
+   EndIO;
+   GrowHeap := Result;
+end; { GrowHeap }
+
+function StoreError(Hz: THz; BytesNeeded: integer): integer;
+const
+   StoreMem = 4096;
+   StoreDisc = 16384;
+var
+   ErrNum: integer;
+begin
+   StoreError := GrowHeap(Hz, BytesNeeded, StoreMem, StoreDisc, WorkingSet, ErrNum);
+end;
+
+{$S }   { the callbacks below stay in the resident main segment }
+
+{ The grow-zone callback of our private heap: nothing to free. }
+function OutOfHeapSpace(hz: THz; bytesNeeded: integer): integer;
+begin
+   OutOfHeapSpace := 0
+end;
+
+{ Alert Manager error procedure: fatal while starting, ignored after. }
+procedure AlertFailed;
+var err: integer;
+begin
+   if initing then begin
+      TellFiler(err, initFailed, noMemory, nil);
+      Halt
+   end
+end;
+
+{ SYS_TERMINATE handler: runs on every exit.  ImDying MUST come first -- }
+{ until we call it the Filer, and with it the whole desktop, waits on us. }
+procedure LastWishes(environPtr: p_env_blk; excepDataPtr: p_ex_data);
+begin
+   ImDying;
+   Halt
+end;
+
+{$S }
+
+{==============================================================================}
+{  Forward declarations                                                        }
+{==============================================================================}
+
+procedure ProcessEvent(var e: EventRecord); forward;
+function NewPage(var pp: PagePtr): Boolean; forward;
+procedure GenLine(var Line: str; Number: integer); forward;
+
+{---------------------------- Install ----------------------------}
+{ Make Folder the port we draw into.                                    }
+
+procedure Install(Folder: WindowPtr);
+begin
+   if Folder <> nil then begin
+      theFolder := Folder;
+      SetPort(theFolder);
+   end;
+end; { Install }
+
+
+{==============================================================================}
+{  The dialog band: prompts, confirmations, messages                          }
+{==============================================================================}
+
+{$S LTEDlg }
+
+procedure GetSelString(var SelString: str; MaxLen: integer);
+begin
+   SelString := '';
+   if IsActive then
+      if The.Select.left.LnCh <> The.Select.right.LnCh then begin
+         GenLine(SelString, The.Select.left.ln);
+         if The.Select.Left.ln = The.Select.Right.ln then
+            if The.Select.Right.Ch - 1 < length(SelString) then
+               SelString[0] := chr(The.Select.Right.Ch - 1);
+         Delete(SelString, 1, The.Select.Left.Ch - 1);
+         TrimStr(SelString);
+         if length(SelString) > MaxLen then SelString[0] := chr(MaxLen);
+      end;
+end;
+
+function AbortFlag: boolean;
+var e: EventRecord;
+begin
+   AbortFlag := false;
+   if PeekEvent(e) then
+      if e.What = KeyDown then
+         AbortFlag := (e.ascii = '.') and e.AppleKey;
+end;
+
+{---------------------------- ReadCh ----------------------------}
+{ Wait for a key.  Updates are serviced; anything else (a click, an    }
+{ Apple-key, a filer event, a deactivation ...) aborts the prompt and   }
+{ is left in the queue for the main loop.                               }
+function ReadCh(var Result: Char): Boolean;
+var
+   e: EventRecord;
+   SaveFolder: WindowPtr;
+begin
+   repeat
+      while not PeekEvent(e) do
+         LetOthersRun;
+      if (e.What = ButtonUp) or (e.What = FolderUpdate) or (e.What = FolderMoved) then begin
+         GetEvent(e);
+         SaveFolder := theFolder;
+         ProcessEvent(e);
+         Install(SaveFolder);
+      end
+      else if e.What <> KeyDown then begin
+         ReadCh := False;
+         Exit(ReadCh);
+      end
+      else if e.AppleKey then begin
+         ReadCh := False;
+         Exit(ReadCh);
+      end;
+   until e.What = KeyDown;
+   GetEvent(e);
+   Result := e.Ascii;
+   ReadCh := True;
+end;
+
+{---------------------------- GetReply ----------------------------}
+function GetReply(var r: str): Boolean;
+label 99;
+var
+   SaveFolder: WindowPtr;
+   ch: Char;
+   s: String[1];
+   sw: integer;
+   t: rect;
+   default: boolean;
+begin
+   default := true;
+   SaveFolder := theFolder;
+   Install(DialogFolder);
+   s := ' ';
+   r := '';
+   repeat
+      if not ReadCh(ch) then begin
+         GetReply := False;
+         goto 99;
+      end;
+      Install(DialogFolder);
+      if ch = bs then begin
+         if length(r) > 0 then begin
+            ch := r[length(r)];
+            delete(r, length(r), 1);
+            with DialogFolder^ do begin
+               sw := charwidth(ch);
+               Move(- sw, 0);
+               setrect(t, pnloc.h, portrect.top, pnloc.h + sw, portrect.bottom);
+               eraserect(t);
+            end;
+         end;
+      end
+      else if ch = ClearCh then begin
+         GetReply := false;
+         goto 99;
+      end
+      else if ch >= ' ' then begin
+         if length(r) = 0 then begin { erase default prompt }
+            with DialogFolder^ do
+               setrect(t, PromptPt.h, PortRect.Top, pnloc.h, PortRect.Bottom);
+            eraserect(t);
+            moveto(PromptPt.h, PromptPt.v);
+            default := false;
+         end;
+         if length(r) < maxwidth then begin
+            drawchar(ch);
+            s[1] := ch;
+            r := concat(r, s);
+         end;
+      end;
+   until (ch = cr) or (ch = EnterCh);
+   GetReply := default or (length(r) <> 0);
+99:
+   Install(SaveFolder);
+end;
+
+{---------------------------- HideTheBox ----------------------------}
+procedure HideTheBox;
+begin
+   DialogHeight(0, False);
+end;
+
+{---------------------------- DrawTheBox ----------------------------}
+procedure DrawTheBox(message: str255);
+var
+   SaveFolder: WindowPtr;
+begin
+   SaveFolder := theFolder;
+   Install(DialogFolder);
+   DialogHeight(BoxHeight, FALSE);
+   eraserect(DialogFolder^.portrect);
+   moveto(DialogFolder^.portrect.left + BoxHOffset,
+          DialogFolder^.portrect.top + BoxVOffset);
+   if length(message) > 0 then
+      if message[length(message)] <> ' ' then message := concat(message, ' ');
+   drawstring(message);
+   GetPen(PromptPt);
+   Install(SaveFolder);
+end;
+
+{---------------------------- AppendBox ----------------------------}
+procedure AppendBox(message: str255);
+var
+   SaveFolder: WindowPtr;
+begin
+   SaveFolder := theFolder;
+   Install(DialogFolder);
+   DrawString(message);
+   Install(SaveFolder);
+end;
+
+procedure PromptBox(message: str255; DefName: str);
+begin
+   DrawTheBox(message);
+   if DefName <> '' then AppendBox(concat(' [', DefName, '] '));
+end;
+
+{---------------------------- Confirm ----------------------------}
+function Confirm(Message: str255): Boolean;
+var
+   ch: char;
+begin
+   ClickOut := false;
+   ch := ' ';
+   DrawTheBox(concat(Message, '? (Y or N) '));
+   repeat until not ReadCh(ch) or (ch in ['Y', 'y', 'N', 'n']);
+   Confirm := ch in ['Y', 'y'];
+   ClickOut := not (ch in ['Y', 'y', 'N', 'n']);
+   HideTheBox;
+end;
+
+{---------------------------- Error ----------------------------}
+procedure Error(Message: str255);
+var
+   Ch: Char;
+begin
+   DrawTheBox(concat('STOP: ', Message, '; type SPACE to continue'));
+   repeat until not ReadCh(Ch) or (Ch = ' ');
+   HideTheBox;
+end;
+
+{---------------------------- Warning ----------------------------}
+procedure Warning(Message: str255);
+var
+   Ch: Char;
+begin
+   DrawTheBox(concat(Message, '; type SPACE to continue'));
+   repeat until not ReadCh(Ch) or (Ch = ' ');
+   HideTheBox;
+end;
+
+{---------------------------- GetNumber ----------------------------}
+function GetNumber(var Value: Integer; default: boolean): Boolean;
+var
+   Reply: str;
+   i: integer;
+begin
+   GetNumber := False;
+   if GetReply(Reply) then
+      if length(Reply) > 0 then begin
+         if StrToNum(Reply, i) then begin
+            GetNumber := True;
+            Value := i;
+         end
+         else Warning('Illegal number');
+      end
+      else GetNumber := default;
+end;
+
+{$S }
+
+{==============================================================================}
+{  Pages                                                                       }
+{==============================================================================}
+
+{---------------------------- NewPage ----------------------------}
+function NewPage{(var pp: PagePtr): Boolean};
+var
+   PageP: TP;
+begin
+   PageP := PAllocate(Store, SizeOf(page));
+   if PageP <> PNil then begin
+      pp := Pointer(Ord(PageP));
+      with pp^ do begin
+         nxtpage := nil;
+         prvpage := nil;
+         linesinp := 0;
+         Sparse := true;
+      end;
+      NewPage := true;
+   end
+   else begin
+      pp := nil;
+      NewPage := false;
+   end;
+end; { NewPage }
+
+{ A page with every character nul }
+function NewClearPage(var pp: PagePtr): Boolean;
+var i: integer;
+begin
+   NewClearPage := false;
+   if NewPage(pp) then begin
+      for i := pagemin to pagemax do pp^.p[i] := nul;
+      NewClearPage := true;
+   end;
+end;
+
+{---------------------------- FreeUp ----------------------------}
+procedure FreeUp(var pp: PagePtr);
+var
+   freepp: PagePtr;
+   count: longint;
+   bytesfreed: TL;
+begin
+   count := 0;
+   while pp <> nil do begin
+      freepp := pp;
+      pp := pp^.nxtpage;
+      FreeP(Store, Pointer(Ord(freepp)));
+      count := count + 1;
+   end;
+   if count > 0 then bytesfreed := CbShrinkHz(Store, count * ord4(1024));
+end; { FreeUp }
+
+{ number of characters in use at the start of a page }
+function PageUsed(pp: PagePtr): integer;
+var i: integer;
+begin
+   i := pagemin;
+   with pp^ do
+      while (i <= pagemax) and (p[i] <> nul) do i := i + 1;
+   PageUsed := i - pagemin;
+end;
+
+{---------------------------- TotalKnt ----------------------------}
+{ count total number of lines in current document }
+procedure TotalKnt;
+var
+   pp: PagePtr;
+   ttl: integer;
+begin
+   ttl := 0;
+   pp := The.HeadList^.nxtpage;
+   while pp <> nil do begin
+      ttl := ttl + pp^.linesinp;
+      pp := pp^.nxtpage;
+   end;
+   The.LinesTot := ttl;
+end; { TotalKnt }
+
+
+{==============================================================================}
+{  Geometry, cursor                                                            }
+{==============================================================================}
+
+{---------------------------- FrameBounds ----------------------------}
+procedure FrameBounds(var r: Rect);
+begin
+   r := theFolder^.PortRect;
+   with theFolder^.portbits.Bounds do
+      OffsetRect(r, - Left, - Top); { to global co-ordinates }
+   with DeskPort^.portbits.Bounds do
+      OffsetRect(r, Left, Top);     { to Desk co-ordinates }
+end;
+
+{---------------------------- BodyRect ----------------------------}
+procedure BodyRect(var Body: Rect);
+begin
+   Body := theFolder^.PortRect;
+   Body.Right := Body.Right - (DhSbox - 1);   { minus scroll bar / grow box }
+   Body.Bottom := Body.Bottom - (DvSbox - 1);
+end;
+
+{---------------------------- IsInBody ----------------------------}
+function IsInBody(Where: Point): Boolean;
+var
+   Body: Rect;
+begin
+   BodyRect(Body);
+   IsInBody := PtInRect(Where, Body);
+end;
+
+{---------------------------- TextRect ----------------------------}
+procedure TextRect(var r: Rect);
+const
+   hindent = 6;
+   vindent = 4;
+begin
+   BodyRect(r);
+   InsetRect(r, hindent, vindent);
+   r.Left := r.Left + MarginW;   { room for the line-number margin }
+end;
+
+{---------------------------- ClipToText ----------------------------}
+{ Clip to an integral number of text lines }
+procedure ClipToText;
+var
+   r: Rect;
+begin
+   TextRect(r);
+   r.Bottom := r.Top + The.LinesVis * The.VertSp;
+   r.Left := r.Left - MarginW;   { the margin's numbers are drawn too }
+   ClipRect(r);
+end;
+
+{---------------------------- Recompute ----------------------------}
+{ The margin width the current view needs: just wide enough for the   }
+{ largest line number on the screen, plus the gap before the text.     }
+function WantMarginW: integer;
+var
+   top, n, digits: integer;
+begin
+   if not ShowNums then WantMarginW := 0
+   else begin
+      top := CMax(The.DocPosn, 0);
+      n := CMin(top + The.LinesVis, The.LinesTot + 1); { last visible, 1-based }
+      if n < 10 then digits := 1
+      else if n < 100 then digits := 2
+      else if n < 1000 then digits := 3
+      else if n < 10000 then digits := 4
+      else digits := 5;
+      WantMarginW := digits * DigitW + 8;
+   end;
+end;
+
+procedure Recompute;
+var
+   Txt: Rect;
+begin
+   { the text's font is the port's font here }
+   DigitW := CharWidth('0');
+   MarginW := 0;
+   TextRect(Txt);   { the height does not depend on the margin }
+   The.LinesVis := (Txt.Bottom - Txt.Top) div The.VertSp;
+   if The.LinesVis < 1 then The.LinesVis := 1;
+   MarginW := WantMarginW;
+end;
+
+{---------------------------- TrackCursor ----------------------------}
+{ I-beam over the text of our active window, arrow elsewhere }
+procedure TrackCursor;
+var
+   saveport: grafptr;
+   MousePt: Point;
+   Frame: Rect;
+begin
+   if not IsActive or (myWindow = nil) then exit(TrackCursor);
+   GetPort(saveport);
+   SetPort(DeskPort);
+   GetMouse(MousePt);
+   SetPort(saveport);
+   Install(myWindow);
+   FrameBounds(Frame);
+   if PtInRect(MousePt, Frame) then begin
+      SubPt(DeskPort^.portbits.Bounds.topleft, MousePt);  { to global }
+      AddPt(myWindow^.portbits.Bounds.topleft, MousePt);  { to window }
+      if IsInBody(MousePt) then SetStdCursor(icrsXIbeam)
+      else SetStdCursor(icrsInactive);
+   end
+   else SetStdCursor(icrsInactive);
+end;
+
+procedure RemoveCursor;
+begin
+   if (IcrsCurrent = icrsXIbeam) then ObscureCursor;
+end;
+
+
+{==============================================================================}
+{  Text addressing and display                                                }
+{==============================================================================}
+
+{---------------------------- FindLine ----------------------------}
+{ Find the page (pp) and character index (ndx) at the beginning of line Ln }
+procedure FindLine(var pp: PagePtr; var ndx: integer; Ln: integer);
+var
+   currln, currndx: integer;
+begin
+   CacheLn := - 1;
+   pp := The.HeadList^.nxtpage; { skip header page }
+   currln := 0;
+   while ((currln + pp^.linesinp) <= Ln) and (pp^.nxtpage <> nil) do begin
+      currln := currln + pp^.linesinp;
+      pp := pp^.nxtpage;
+   end;
+   if ((currln + pp^.linesinp) < Ln) and (pp^.nxtpage = nil) then
+      Ln := currln + pp^.linesinp; { past the end: clamp }
+   currndx := pagemin;
+   with pp^ do
+      while (currln < Ln) and (currndx < pagemax) do begin
+         if (p[currndx] = cr) or (p[currndx] = nul) then currln := currln + 1;
+         currndx := currndx + 1;
+      end;
+   ndx := currndx;
+end; { FindLine }
+
+{---------------------------- GenLine ----------------------------}
+procedure GenLine{(var Line: str; Number: integer)};
+type
+   byte = 0..255;
+   bytearray = packed array [0..maxwidth] of byte;
+var
+   start, ndx, count: integer;
+   pp: PagePtr;
+   p1, p2: ^bytearray;
+begin
+   if CacheLn = Number then begin
+      Line := CacheLine;
+      exit(GenLine);
+   end;
+   FindLine(pp, ndx, Number);
+   start := ndx;
+   with pp^ do
+      while (ndx <= pagemax) and (p[ndx] <> cr) and (p[ndx] <> nul) do
+         ndx := ndx + 1;
+   count := CMin(ndx - start, maxwidth);
+   if count > 0 then begin
+      p1 := pointer(ord(@pp^.p) + start);
+      p2 := @Line;
+      p2^[0] := count;
+      p2 := pointer(ord(p2) + 1);
+      moveleft(p1^, p2^, count);
+   end
+   else Line := '';
+   CacheLn := Number;
+   CacheLine := Line;
+end; { GenLine }
+
+{ length of line Ln }
+function LnLength(Ln: integer): integer;
+var Line: str;
+begin
+   GenLine(Line, Ln);
+   LnLength := length(Line);
+end;
+
+{ the highest useful DocPosn: room for the empty line after the last CR }
+function MaxPosn: integer;
+begin
+   MaxPosn := CMax(0, The.LinesTot + 1 - The.LinesVis);
+end;
+
+{---------------------------- Visible ----------------------------}
+function Visible(Line: integer): Boolean;
+begin
+   Visible := (Line >= The.DocPosn) and (Line < The.DocPosn + The.LinesVis);
+end;
+
+{---------------------------- FindChar ----------------------------}
+{ Find Where (Ln/Ch) is the character at Pt }
+procedure FindChar(Pt: Point; var Where: Place);
+label 59;
+var
+   tr, tc, MaxLnx: integer;
+   t: Rect;
+   Contents: str;
+   ChSize: integer;
+begin
+   TextRect(t);
+   Where.Ln := The.DocPosn;
+   Where.Ch := 1;
+   MaxLnx := CMin(The.LinesTot, The.DocPosn + The.LinesVis);
+   if Pt.v < t.Top then Exit(FindChar)
+   else if Pt.v >= t.Bottom then begin
+      Where.Ln := MaxLnx;
+      Exit(FindChar);
+   end;
+   tr := t.Top + The.VertSp;
+   while (tr < Pt.v) and (Where.Ln < MaxLnx) do begin
+      tr := tr + The.VertSp;
+      Where.Ln := Where.Ln + 1;
+   end;
+   GenLine(Contents, Where.Ln);
+   tc := t.Left;
+   repeat
+      if Where.Ch <= Length(Contents) then ChSize := CharWidth(Contents[Where.Ch])
+      else goto 59;
+      if Pt.h <= (tc + The.Before + (ChSize - The.Before) div 2) then goto 59;
+      tc := tc + ChSize;
+      Where.Ch := Where.Ch + 1;
+   until false;
+59:
+end; { FindChar }
+
+{---------------------------- FindPoint ----------------------------}
+procedure FindPoint(var Pt: Point; Where: Place);
+var
+   t: Rect;
+   Contents: str;
+   ChCount: integer;
+begin
+   TextRect(t);
+   if Where.Ln < The.DocPosn then Pt := t.topleft
+   else if Where.Ln >= The.DocPosn + The.LinesVis then begin
+      Pt.v := t.Top + The.Above + (The.LinesVis - 1) * The.VertSp;
+      Pt.h := t.Right;
+   end
+   else begin
+      Pt.v := t.Top + The.Above + (Where.Ln - The.DocPosn) * The.VertSp;
+      GenLine(Contents, Where.Ln);
+      ChCount := Where.Ch - 1;
+      if ChCount = 0 then Pt.h := t.Left
+      else if ChCount >= maxwidth then Pt.h := t.Right
+      else if ChCount <= Length(Contents) then
+         Pt.h := t.Left + TextWidth(@Contents, 1, ChCount)
+      else Pt.h := t.Left + TextWidth(@Contents, 1, Length(Contents)) +
+                   (ChCount - Length(Contents)) * The.SpaceW;
+      if Pt.h > t.Right then Pt.h := t.Right;
+   end;
+end; { FindPoint }
+
+{---------------------------- IsInsertion ----------------------------}
+function IsInsertion: Boolean;
+begin
+   IsInsertion := IsActive and (theFolder = myWindow) and
+                  (The.Select.Left.LnCh = The.Select.Right.LnCh);
+end;
+
+{---------------------------- CaretVis ----------------------------}
+{ Changes visibility state of the caret (drawn with XOR) }
+procedure CaretVis(WantVis: Boolean);
+var
+   Caret: Point;
+begin
+   if not IsActive then
+      IsCaretVis := false
+   else if IsInsertion then
+      if not Visible(The.Select.Left.Ln) then
+         IsCaretVis := false
+      else if (IsCaretVis = WantVis) then
+         { Caret is as specified }
+      else begin
+         FindPoint(Caret, The.Select.Left);
+         penmode(patXor);
+         moveto(Caret.h, Caret.v + The.Below - 1);
+         Line(0, - The.VertSp + 1);
+         pennormal;
+         IsCaretVis := WantVis;
+      end;
+end; { CaretVis }
+
+{---------------------------- IsSelection ----------------------------}
+function IsSelection: Boolean;
+begin
+   IsSelection := IsActive and (theFolder = myWindow) and
+                  (The.Select.Left.LnCh <> The.Select.Right.LnCh);
+end;
+
+{---------------------------- InvText ----------------------------}
+procedure InvText(t: Rect; p1, p2: Point);
+var
+   temp: Rect;
+
+   function gtrpoint(p1, p2: Point): Boolean;
+   begin
+      if p2.v > p1.v then gtrpoint := true
+      else if p2.v < p1.v then gtrpoint := false
+      else gtrpoint := (p2.h > p1.h);
+   end;
+
+   procedure swappoints(var p1, p2: Point);
+   var
+      p3: Point;
+   begin
+      p3 := p1;
+      p1 := p2;
+      p2 := p3;
+   end;
+
+begin
+   if (p1.h <> p2.h) or (p1.v <> p2.v) then begin
+      if gtrpoint(p2, p1) then swappoints(p2, p1);
+      p1.v := p1.v - The.Above;
+      p2.v := p2.v - The.Above;
+      temp.topleft := p1;
+      if (temp.Top < p2.v) and (temp.Top >= t.Top) then begin
+         temp.Right := t.Right;
+         temp.Bottom := temp.Top + The.VertSp;
+         invertrect(temp);
+         temp.Top := temp.Bottom;
+         temp.Left := t.Left;
+      end;
+      if temp.Top < p2.v then begin
+         temp.Right := t.Right;
+         temp.Bottom := p2.v;
+         invertrect(temp);
+         temp.Top := temp.Bottom;
+      end;
+      temp.Right := p2.h;
+      temp.Bottom := p2.v + The.VertSp;
+      invertrect(temp);
+   end;
+end; { InvText }
+
+{---------------------------- InvSelection ----------------------------}
+procedure InvSelection(Start: Place; Stop: Place);
+var
+   StartPt, StopPt: Point;
+   t: Rect;
+begin
+   TextRect(t);
+   FindPoint(StartPt, Start);
+   FindPoint(StopPt, Stop);
+   if Stop.Ch > 1 then StopPt.h := StopPt.h + The.After;
+   InvText(t, StartPt, StopPt);
+end;
+
+{---------------------------- SetInsertion ----------------------------}
+procedure SetInsertion(Where: Place);
+begin
+   if IsInsertion then CaretVis(false);
+   with The.Select do begin
+      Left := Where;
+      Right := Left;
+   end;
+end;
+
+{---------------------------- SetSelection ----------------------------}
+procedure SetSelection(Start: Place; Stop: Place);
+begin
+   if IsInsertion then CaretVis(false);
+   if (Start.LnCh = The.Select.Left.LnCh) then
+      InvSelection(Stop, The.Select.Right)
+   else if (Stop.LnCh = The.Select.Right.LnCh) then
+      InvSelection(Start, The.Select.Left)
+   else begin
+      InvSelection(The.Select.Left, The.Select.Right);
+      InvSelection(Start, Stop);
+   end;
+   The.Select.Left := Start;
+   The.Select.Right := Stop;
+end;
+
+{---------------------------- Repaint ----------------------------}
+{ Redraw Count lines starting at line # First }
+procedure Repaint(First, Count: integer);
+label 10;
+var
+   Start, Stop: Place;
+   LineNumber, thisrow: integer;
+   t, Paintrect: Rect;
+   ndx, StartNdx: integer;
+   pp: PagePtr;
+   StartPt, LeftPt, RightPt: Point;
+   NumStr: str;
+begin
+   CaretVis(false);
+   TextRect(t);
+   Start.Ln := First;
+   Start.Ch := 1;
+   { up to and including line LinesTot: the (empty) line after the last CR }
+   Stop.Ln := First + CMin(Count, The.LinesTot + 1 - First) - 1;
+   Stop.Ch := maxwidth + 1;
+   FindPoint(StartPt, Start);
+   SetRect(Paintrect, t.Left - MarginW, StartPt.v - The.Above, t.Right,
+           StartPt.v - The.Above + Count * The.VertSp);
+   eraserect(Paintrect);
+   thisrow := StartPt.v;
+   FindLine(pp, ndx, Start.Ln);
+   for LineNumber := Start.Ln to Stop.Ln do begin
+      if ShowNums then begin  { the number, right-aligned in the margin }
+         NumToStr(LineNumber + 1, NumStr);
+         moveto(t.Left - 8 - StringWidth(NumStr), thisrow);
+         DrawString(NumStr);
+      end;
+      if pp = nil then goto 10;
+      moveto(StartPt.h + The.Before, thisrow);
+      StartNdx := ndx;
+      with pp^ do
+         while (ndx < pagemax) and (p[ndx] <> cr) and (p[ndx] <> nul) and (p[ndx] <> tab) do
+            ndx := ndx + 1;
+      DrawText(@pp^.p, StartNdx, ndx - StartNdx);
+      if pp^.p[ndx] = tab then ndx := ndx + 1; { tabs are never stored; be safe }
+      if pp^.p[ndx] = cr then ndx := ndx + 1;
+      if (ndx > pagemax) or (pp^.p[ndx] = nul) then begin
+         pp := pp^.nxtpage;
+         ndx := pagemin;
+      end;
+      thisrow := thisrow + The.VertSp;
+   end;
+10:
+   if IsInsertion then begin
+      if (The.Select.Left.Ln >= Start.Ln) and (The.Select.Left.Ln <= Stop.Ln) then
+         IsCaretVis := false;
+   end
+   else if IsSelection then
+      if (The.Select.Left.Ln <= Stop.Ln) and (The.Select.Right.Ln >= Start.Ln) then begin
+         if The.Select.Left.Ln >= Start.Ln then FindPoint(LeftPt, The.Select.Left)
+         else FindPoint(LeftPt, Start);
+         if The.Select.Right.Ln <= Stop.Ln then begin
+            FindPoint(RightPt, The.Select.Right);
+            if The.Select.Right.Ch > 1 then RightPt.h := RightPt.h + The.After;
+         end
+         else FindPoint(RightPt, Stop);
+         InvText(t, LeftPt, RightPt);
+      end;
+end; { Repaint }
+
+{---------------------------- ScrollUpDown ----------------------------}
+{ If the largest visible line number now has more (or fewer) digits,  }
+{ resize the margin and redraw the visible text, shifted accordingly. }
+procedure FitMargin;
+var
+   w: integer;
+begin
+   if theFolder <> myWindow then exit(FitMargin);
+   w := WantMarginW;
+   if w <> MarginW then begin
+      CaretVis(false);   { while the caret's place is still the old one }
+      MarginW := w;
+      ClipToText;
+      Repaint(The.DocPosn, The.LinesVis);   { erases from the margin's left edge }
+   end;
+end;
+
+procedure ScrollUpDown(Amount: integer); { Positive => Up }
+var
+   Start: integer;
+   t, UpDownrect: Rect;
+begin
+   Start := The.DocPosn + Amount;
+   if Start > MaxPosn then Start := MaxPosn;
+   if Start < 0 then Start := 0;
+   Amount := Start - The.DocPosn;
+   if Start <> The.DocPosn then begin
+      CaretVis(false);
+      TextRect(t);
+      SetRect(UpDownrect, t.Left - MarginW, t.Top, t.Right,
+              t.Top + The.LinesVis * The.VertSp);  { numbers scroll too }
+      Scrollrect(UpDownrect, 0, - Amount * The.VertSp, DummyRgn);
+      The.DocPosn := Start;
+      if Amount > 0 then Repaint(Start + The.LinesVis - Amount, Amount)
+      else Repaint(Start, - Amount);
+      FitMargin;
+   end;
+end;
+
+{---------------------------- UpdateElev ----------------------------}
+procedure UpdateElev(Elev: integer);
+begin
+   if Elev <> The.ElevPosn then begin
+      The.ElevPosn := Elev;
+      if IsActive and SBMade and (theFolder = myWindow) then begin
+         SetupMvThumb(RightSBox);
+         ClipRect(theFolder^.PortRect);
+         MoveThumb(Elev);
+         ClipToText;
+         PenRestore;
+      end;
+   end;
+end;
+
+{---------------------------- UpdateDoc ----------------------------}
+procedure UpdateDoc(NewPosn: integer);
+var
+   OldPosn: integer;
+begin
+   OldPosn := The.DocPosn;
+   NewPosn := CMax(0, CMin(MaxPosn, NewPosn));
+   if NewPosn = OldPosn then
+   else if Abs(NewPosn - OldPosn) < The.LinesVis then ScrollUpDown(NewPosn - OldPosn)
+   else begin
+      The.DocPosn := NewPosn;
+      Repaint(NewPosn, The.LinesVis);
+      FitMargin;
+   end;
+end;
+
+{---------------------------- CalcElevPosn ----------------------------}
+function CalcElevPosn(Line: integer): integer;
+const
+   ElevTravel = 1000;
+var
+   LineTravel: integer;
+begin
+   LineTravel := MaxPosn;
+   if (Line <= 0) or (LineTravel <= 0) then CalcElevPosn := 0
+   else if Line >= LineTravel then CalcElevPosn := ElevTravel
+   else CalcElevPosn := (Ord4(ElevTravel) * Line) div LineTravel;
+end;
+
+{---------------------------- CalcDocPosn ----------------------------}
+function CalcDocPosn(Elev: integer): integer;
+const
+   ElevTravel = 1000;
+var
+   LineTravel: integer;
+begin
+   LineTravel := MaxPosn;
+   if LineTravel <= 0 then CalcDocPosn := 0
+   else CalcDocPosn := Ord4(LineTravel) * Elev div ElevTravel;
+end;
+
+{---------------------------- Display ----------------------------}
+procedure Display(Ln: integer);
+begin
+   UpdateDoc(Ln);
+   UpdateElev(CalcElevPosn(Ln));
+end;
+
+{---------------------------- MakeVisible ----------------------------}
+procedure MakeVisible;
+begin
+   if not Visible(The.Select.Left.Ln) then Display(The.Select.Left.Ln - (The.LinesVis div 2))
+   else UpdateElev(CalcElevPosn(The.DocPosn));
+end;
+
+{---------------------------- InvalidPosn ----------------------------}
+procedure InvalidPosn; { force update of Doc next time }
+begin
+   The.DocPosn := - 999;
+end;
+
+{---------------------------- PaintDoc ----------------------------}
+procedure PaintDoc(NewDoc: integer);
+begin
+   The.DocPosn := - 999;
+   UpdateDoc(NewDoc);
+end;
+
+{---------------------------- PaintElev ----------------------------}
+procedure PaintElev(NewElev: integer);
+begin
+   The.ElevPosn := - 999;
+   UpdateElev(NewElev);
+end;
+
+{---------------------------- DrawFolder ----------------------------}
+{---------------------------- DrawStatus ----------------------------}
+{ The status line in the bottom bar: where the insertion point is,       }
+{ or both ends of the selection, 1-based.  Redrawn only when the        }
+{ selection changed, unless Force.                                       }
+procedure DrawStatus(Force: boolean);
+var
+   s, n: str;
+   r: Rect;
+begin
+   if not StatusOK or (myWindow = nil) or (theFolder <> myWindow) then exit(DrawStatus);
+   if not Force then
+      if (The.Select.Left.LnCh = StatusSel.Left.LnCh) and
+         (The.Select.Right.LnCh = StatusSel.Right.LnCh) then exit(DrawStatus);
+   StatusSel := The.Select;
+   NumToStr(The.Select.Left.Ln + 1, n);
+   s := concat('Line ', n);
+   NumToStr(The.Select.Left.Ch, n);
+   s := concat(s, ', Column ', n);
+   if The.Select.Left.LnCh <> The.Select.Right.LnCh then begin
+      NumToStr(The.Select.Right.Ln + 1, n);
+      s := concat(s, '   to   Line ', n);
+      NumToStr(The.Select.Right.Ch, n);
+      s := concat(s, ', Column ', n);
+   end;
+   r := StatusRect;
+   InsetRect(r, 1, 1);
+   ClipRect(theFolder^.PortRect);
+   EraseRect(r);
+   ClipRect(r);
+   TextFont(p15Tile);                 { small: the bar is only one scroll bar high }
+   MoveTo(r.Left + 6, r.Bottom - 3);
+   DrawString(s);
+   TextFont(The.FontId.Fam);          { back to the text's font }
+   ClipToText;
+end;
+
+{---------------------------- ShowTitle ----------------------------}
+{ The window title shows the .TEXT file's name; a text never saved to a }
+{ file is "New text file".  (The Filer's own title is put back when the  }
+{ window is returned: RestoreTitle.)                                     }
+procedure ShowTitle;
+var
+   t: str255;
+begin
+   if myWindow = nil then exit(ShowTitle);
+   if The.HasFile then t := The.FileName
+   else t := 'New text file';
+   if t <> ShownTitle then begin
+      SetFldrTitle(myWindow, t);
+      ShownTitle := t;
+   end;
+end;
+
+{ Give the window its own title back before it returns to the Filer }
+procedure RestoreTitle;
+begin
+   if myWindow <> nil then
+      if ShownTitle <> OrigTitle then SetFldrTitle(myWindow, OrigTitle);
+   ShownTitle := OrigTitle;
+end;
+
+{---------------------------- DrawFolder ----------------------------}
+{ The right scroll bar, the grow box, and (where a horizontal scroll    }
+{ bar would be) the status line in the bottom bar.                      }
+procedure DrawFolder;
+var
+   RightEdge, BottomEdge: Rect;
+begin
+   if not SBMade then exit(DrawFolder);
+   ClipRect(theFolder^.PortRect);
+   FlushRects(BottomEdge, RightEdge);
+   SetSbRect(RightSBox, RightEdge);
+   SetSbRect(HSBNext(RightSBox), BottomEdge);
+   PaintSb(RightSBox);
+   EraseRect(BottomEdge);
+   FrameRect(BottomEdge);
+   PaintGrow;
+   StatusRect := BottomEdge;
+   StatusOK := true;
+   DrawStatus(true);
+   ClipToText;
+end;
+
+{---------------------------- UnDrawFolder ----------------------------}
+procedure UnDrawFolder; { Remove scroll bars, arrows, etc. }
+begin
+   StatusOK := false;
+   ClipRect(theFolder^.PortRect);
+   HideSBorder(theFolder^.PortRect);
+   ClipToText;
+end;
+
+{---------------------------- StartCmd ----------------------------}
+procedure StartCmd(Which: Cmds; IsUndoable: Boolean);
+begin
+   Last.Cmd := Which;
+   Last.Undoable := IsUndoable;
+   if Which <> CmdUndo then begin
+      if Last.Data in [CmdCut, CmdCopy, CmdPaste, CmdType] then FreeUp(Last.List);
+      Last.Data := Which;
+      if Which in [CmdCut, CmdCopy, CmdPaste, CmdType, CmdSelAll] then begin
+         Last.List := nil;
+         Last.Select := The.Select;
+      end;
+   end;
+end;
+
+
+{==============================================================================}
+{  Selection                                                                   }
+{==============================================================================}
+
+function CharInLine(var Line: str; chx: integer): char;
+begin
+   if (chx < 1) or (chx > Length(Line)) then CharInLine := ' '
+   else CharInLine := Line[chx];
+end;
+
+{---------------------------- Drag ----------------------------}
+procedure Drag(PrevPt: Point);
+type
+   RelPos = (BeforeAnchor, InAnchor, AfterAnchor);
+var
+   TempPt, CurrPt: point;
+   LeftAnchor, RightAnchor, Curr, Prev: Place;
+   t: rect;
+   Line: str;
+   PortTop, PortBottom: integer;
+
+   function RelAnchor(p: place): RelPos;
+   begin
+      if p.LnCh < LeftAnchor.LnCh then RelAnchor := BeforeAnchor
+      else if RightAnchor.LnCh < p.LnCh then RelAnchor := AfterAnchor
+      else RelAnchor := InAnchor;
+   end;
+
+   procedure UpDateDragDisplay;
+   begin
+      case RelAnchor(Curr) of
+         BeforeAnchor: SetSelection(Curr, RightAnchor);
+         InAnchor:     SetSelection(LeftAnchor, RightAnchor);
+         AfterAnchor:  SetSelection(LeftAnchor, Curr);
+      end;
+   end;
+
+begin
+   TextRect(t);
+   LeftAnchor := The.Select.Left;
+   RightAnchor := The.Select.Right;
+   FindChar(PrevPt, Prev);
+   PortTop := theFolder^.PortRect.Top;
+   PortBottom := theFolder^.PortRect.Bottom;
+   while StillDown do begin
+      GetMouse(CurrPt);
+      if CurrPt.v > PortBottom then begin
+         ScrollUpDown(1);
+         UpdateElev(CalcElevPosn(The.DocPosn));
+      end
+      else if CurrPt.v < PortTop then begin
+         ScrollUpDown(- 1);
+         UpdateElev(CalcElevPosn(The.DocPosn));
+      end
+      else begin { vertical hysteresis }
+         if CurrPt.v > PrevPt.v - The.Above - The.VertSp * tophysteresis div 100 then
+            if CurrPt.v < PrevPt.v + The.Below + The.VertSp * bothysteresis div 100 then
+               CurrPt.v := PrevPt.v;
+      end;
+
+      FindChar(CurrPt, Curr);
+
+      if (Curr.LnCh <> Prev.LnCh) then begin
+         if Visible(Curr.Ln) then begin
+            if (targsize = double) then begin { extend to word boundary }
+               GenLine(Line, Curr.Ln);
+               if (Curr.LnCh < LeftAnchor.LnCh) then begin
+                  if CharInLine(Line, Curr.Ch) in alphanum then
+                     while CharInLine(Line, Curr.Ch - 1) in alphanum do Curr.Ch := Curr.Ch - 1;
+               end
+               else if CharInLine(Line, Curr.Ch - 1) in alphanum then
+                  while CharInLine(Line, Curr.Ch) in alphanum do Curr.Ch := Curr.Ch + 1;
+            end
+            else if (targsize = triple) then begin { extend to line boundary }
+               if Curr.Ln >= LeftAnchor.Ln then Curr.Ln := CMin(Curr.Ln, The.LinesTot);
+               Curr.Ch := 1;
+            end;
+         end;
+         if (LeftAnchor.LnCh < Curr.LnCh) and (Curr.Ch > 1) then begin
+            FindPoint(TempPt, Curr);
+            TempPt.h := TempPt.h + The.After;
+            FindChar(TempPt, Curr);
+         end;
+
+         UpDateDragDisplay;
+
+         if IsInsertion then CaretVis(True);
+         Prev := Curr;
+         FindPoint(PrevPt, Curr);
+      end;
+   end;
+end; { Drag }
+
+procedure CharSelect(MousePt: Point);
+var
+   Mouse: Place;
+begin
+   FindChar(MousePt, Mouse);
+   SetInsertion(Mouse);
+end;
+
+procedure WordSelect(MousePt: Point);
+var
+   Line: str;
+begin
+   GenLine(Line, The.Select.Left.Ln);
+   while CharInLine(Line, The.Select.Left.Ch - 1) in alphanum do
+      The.Select.Left.Ch := The.Select.Left.Ch - 1;
+   if The.Select.Right.Ln <> The.Select.Left.Ln then
+      GenLine(Line, The.Select.Right.Ln);
+   while CharInLine(Line, The.Select.Right.Ch) in alphanum do
+      The.Select.Right.Ch := The.Select.Right.Ch + 1;
+end;
+
+procedure LineSelect(MousePt: Point);
+begin
+   The.Select.Left.Ch := 1;
+   The.Select.Right.Ln := CMin(The.Select.Right.Ln + 1, The.LinesTot);
+   The.Select.Right.Ch := 1;
+end;
+
+{---------------------------- Select ----------------------------}
+procedure Select(Where: Point);
+begin
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   if IsInsertion then CaretVis(False);
+   case targsize of
+      single: CharSelect(Where);
+      double: WordSelect(Where);
+      triple: LineSelect(Where);
+      beyond: targsize := triple;
+   end;
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right)
+   else CaretVis(True);
+   Drag(Where);
+end;
+
+{---------------------------- ExtendSelect ----------------------------}
+procedure ExtendSelect(Where: Point);
+var
+   NewPlace: place;
+begin
+   FindChar(Where, NewPlace);
+   if NewPlace.LnCh <= The.Select.Left.LnCh then
+      SetSelection(NewPlace, The.Select.Right)
+   else
+      SetSelection(The.Select.Left, NewPlace);
+   Drag(Where);
+end;
+
+{---------------------------- SelectAll ----------------------------}
+procedure SelectAll;
+begin
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   if IsInsertion then CaretVis(False);
+   The.Select.Left.Ln := 0;
+   The.Select.Left.Ch := 1;
+   The.Select.Right.Ln := The.LinesTot;
+   The.Select.Right.Ch := 1;
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right)
+   else CaretVis(True);
+end;
+
+
+{==============================================================================}
+{  Cut / Copy / Delete                                                        }
+{==============================================================================}
+
+{$S LTEEdit }
+
+{ Recomputes linesinp for all pages from lpp to rpp }
+procedure KntLines(lpp, rpp: pageptr);
+
+   procedure Knt(pp: pageptr);
+   var
+      i: integer;
+   begin
+      if pp <> nil then
+         with pp^ do begin
+            linesinp := 0;
+            for i := pagemin to pagemax do begin
+               if p[i] = cr then
+                  linesinp := linesinp + 1
+               else if (p[i] = nul) then begin
+                  if nxtpage <> nil then
+                     if i > pagemin then
+                        if p[i - 1] <> cr then
+                           linesinp := linesinp + 1;
+                  exit(knt);
+               end;
+            end;
+         end;
+   end; { Knt }
+
+begin
+   if lpp = rpp then
+      Knt(lpp)
+   else begin
+      Knt(lpp);
+      repeat
+         lpp := lpp^.nxtpage;
+         Knt(lpp);
+      until (lpp = rpp) or (lpp = nil);
+   end;
+end; { KntLines }
+
+{ chx := chars from line start (p[ndx]) to the position; returns its index }
+function MarkPos(pp: pageptr; ndx: Integer; var chx: Integer): Integer;
+var
+   dk: Integer;
+begin
+   if chx = 1 then MarkPos := ndx
+   else
+      with pp^ do begin
+         dk := 1;
+         while (dk < chx) and (p[ndx] <> cr) and (p[ndx] <> nul) do begin
+            dk := dk + 1;
+            ndx := ndx + 1;
+         end;
+         MarkPos := ndx;
+         chx := dk;
+      end;
+end;
+
+{ count of chars remaining on the line at pp^.p[ndx], CR included }
+function RemainingChrs(pp: pageptr; ndx: Integer): Integer;
+var
+   Count: Integer;
+begin
+   Count := 0;
+   with pp^ do
+      while (p[ndx] <> nul) and (ndx < pagemax) do begin
+         Count := Count + 1;
+         if (p[ndx] = cr) or (p[ndx] = nul) then begin
+            RemainingChrs := Count;
+            Exit(RemainingChrs);
+         end;
+         ndx := ndx + 1;
+      end;
+   RemainingChrs := Count;
+end;
+
+function LineEnd(pp: pageptr; ndx: integer): integer; forward;
+function LineBegin(pp: pageptr; ndx: integer): integer; forward;
+
+{ Keep the invariant that the text ends with a CR: the place after       }
+{ the last CR is the (empty) line LinesTot where typing appends.         }
+procedure FixDocEnd;
+var
+   pp: PagePtr;
+   n: integer;
+begin
+   pp := The.HeadList^.nxtpage;
+   while pp^.nxtpage <> nil do pp := pp^.nxtpage;
+   n := PageUsed(pp);
+   if n > 0 then
+      if (pp^.p[n - 1] <> cr) and (n < pagemax) then begin
+         pp^.p[n] := cr;
+         KntLines(pp, pp);
+      end;
+   TotalKnt;
+end;
+
+{------------------------- markers follow edits -------------------------}
+{ Cut, Paste and backspace move the markers so they stay on their text. }
+
+{ Where place p ends up when range c is removed: unchanged before c, the }
+{ start of c inside it, moved back after it.                            }
+procedure MovePlace(c: Range; var p: Place);
+begin
+   if p.LnCh < c.Left.LnCh then
+      { before the cut: unchanged }
+   else if p.LnCh <= c.Right.LnCh then p := c.Left
+   else if p.Ln = c.Right.Ln then begin
+      p.Ln := c.Left.Ln;
+      p.Ch := c.Left.Ch + p.Ch - c.Right.Ch;
+   end
+   else p.Ln := p.Ln - c.Right.Ln + c.Left.Ln;
+end;
+
+{ The text in range c is being removed.  Remove: markers lying wholly   }
+{ inside c are deleted (with a message).                                }
+procedure CutMarks(c: Range; Remove: boolean);
+var
+   i, j, gone: integer;
+   s: str;
+begin
+   gone := 0;
+   i := 1;
+   while i <= The.NumMarkers do
+      if Remove and (c.Left.LnCh < The.Markers[i].p.Left.LnCh) and
+         (The.Markers[i].p.Right.LnCh <= c.Right.LnCh) then begin
+         for j := i to The.NumMarkers - 1 do The.Markers[j] := The.Markers[j + 1];
+         The.NumMarkers := The.NumMarkers - 1;
+         gone := gone + 1;
+      end
+      else begin
+         MovePlace(c, The.Markers[i].p.Left);
+         MovePlace(c, The.Markers[i].p.Right);
+         i := i + 1;
+      end;
+   if gone > 0 then begin
+      NumToStr(gone, s);
+      if gone = 1 then Warning(concat(s, ' marker deleted by cut'))
+      else Warning(concat(s, ' markers deleted by cut'));
+   end;
+end;
+
+{ Text is being inserted at place At: NumLns line breaks, and NumChs  }
+{ characters after the last one (or in all, without a line break).    }
+procedure PasteMarks(At: Place; NumLns, NumChs: integer);
+var
+   i: integer;
+
+   procedure Shift(var p: Place);
+   begin
+      if At.LnCh <= p.LnCh then begin
+         if p.Ln = At.Ln then
+            if NumLns = 0 then p.Ch := p.Ch + NumChs
+            else p.Ch := NumChs + 1 + p.Ch - At.Ch;
+         p.Ln := p.Ln + NumLns;
+      end;
+   end;
+
+begin
+   for i := 1 to The.NumMarkers do begin
+      Shift(The.Markers[i].p.Left);
+      Shift(The.Markers[i].p.Right);
+   end;
+end;
+
+{ Drop markers that do not fit the text (after loading a file / the }
+{ saved text)                                                       }
+procedure ValidMarks;
+var
+   i, j: integer;
+   ok: boolean;
+begin
+   if (The.NumMarkers < 0) or (The.NumMarkers > MarkerMax) then The.NumMarkers := 0;
+   i := 1;
+   while i <= The.NumMarkers do begin
+      with The.Markers[i].p do
+         ok := (length(The.Markers[i].name) > 0) and
+               (Left.Ln >= 0) and (Left.Ln <= The.LinesTot) and
+               (Right.Ln >= 0) and (Right.Ln <= The.LinesTot) and
+               (Left.Ch >= 1) and (Left.Ch <= maxwidth + 1) and
+               (Right.Ch >= 1) and (Right.Ch <= maxwidth + 1) and
+               (Left.LnCh <= Right.LnCh);
+      if ok then i := i + 1
+      else begin
+         for j := i to The.NumMarkers - 1 do The.Markers[j] := The.Markers[j + 1];
+         The.NumMarkers := The.NumMarkers - 1;
+      end;
+   end;
+end;
+
+{---------------------------- Cut ----------------------------}
+{ Cut the selected stuff and return with the cut characters in junklist }
+procedure Cut(var junklist: pageptr);
+label 200;
+var
+   leftpp, rightpp: pageptr;
+   leftndx, rightndx, markleft, markright, diff: integer;
+   t, t2: rect;
+   Line: str;
+   CutPt: Point;
+
+   procedure AbortCut;
+   begin
+      Error(ConCat('Can''t Cut because ', OutOfMem));
+      FreeUp(junklist);
+      TotalKnt;
+      goto 200;
+   end;
+
+   procedure CutInPage;
+   var
+      i, j, k, l: Integer;
+      pp: pageptr;
+   begin
+      if not NewPage(pp) then abortcut;
+      pp^.nxtpage := nil;
+      junklist := pp;
+      l := PageMin;
+      with leftpp^ do begin
+         for k := markleft to markright - 1 do begin
+            pp^.p[l] := p[k];
+            l := l + 1;
+         end;
+         for k := l to pagemax do pp^.p[k] := nul;
+         i := markleft;
+         for j := markright to pagemax do begin
+            p[i] := p[j];
+            i := i + 1;
+         end;
+         for k := i to pagemax do p[k] := nul;
+         if p[MarkLeft] = nul then
+            if MarkLeft > 0 then
+               if p[MarkLeft - 1] <> Cr then
+                  p[MarkLeft] := Cr;
+         Sparse := True;
+      end;
+      KntLines(pp, pp);
+      if leftpp^.p[pagemin] = nul then { empty page }
+         if (leftpp <> The.headlist^.nxtpage) or (leftpp^.nxtpage <> nil) then begin
+            leftpp^.prvpage^.nxtpage := leftpp^.nxtpage;
+            if leftpp^.nxtpage <> nil then
+               leftpp^.nxtpage^.prvpage := leftpp^.prvpage;
+            Leftpp^.nxtpage := nil;
+            FreeUp(Leftpp);
+            Leftpp := nil;
+            Rightpp := Leftpp;
+         end;
+   end; { CutInPage }
+
+   procedure CutAcrossPage;
+   var
+      i, j, l, m, r, rc: Integer;
+      lpp, rpp, tpp, pp, qq, rr, ss: pageptr;
+   begin
+      if not NewPage(pp) then abortcut;
+      junklist := pp;
+      if not NewPage(qq) then abortcut;
+      qq^.nxtpage := nil;
+      pp^.nxtpage := qq;
+      ss := pp;
+      l := markleft;
+      lpp := leftpp;
+      r := markright;
+      rpp := rightpp;
+      while lpp^.nxtpage <> rpp do begin { splice out whole pages between }
+         rr := lpp^.nxtpage;
+         lpp^.nxtpage := rr^.nxtpage;
+         rr^.nxtpage := qq;
+         ss^.nxtpage := rr;
+         rr^.prvpage := ss;
+         ss := rr;
+      end;
+      rpp^.prvpage := lpp;
+      qq^.prvpage := ss;
+      m := pagemin;
+      for i := l to pagemax do begin
+         pp^.p[m] := lpp^.p[i];
+         m := m + 1;
+      end;
+      for i := m to pagemax do pp^.p[i] := nul;
+      KntLines(pp, pp);
+      lpp^.Sparse := True;
+      if r > 0 then begin
+         for i := pagemin to r - (1 - pagemin) do qq^.p[i] := rpp^.p[i];
+         for i := r + pagemin to pagemax do qq^.p[i] := nul;
+         KntLines(qq, qq);
+      end
+      else begin
+         ss^.nxtpage := nil;
+         FreeUp(qq);
+      end;
+      rpp^.Sparse := True;
+      rc := RemainingChrs(rpp, r);
+      if l + rc > pagemax then begin
+         if not NewPage(tpp) then abortcut;
+         i := pagemin;
+         if l > leftndx then
+            for j := leftndx to l - 1 do begin
+               tpp^.p[i] := lpp^.p[j];
+               i := i + 1;
+            end;
+         for j := leftndx to pagemax do lpp^.p[j] := nul;
+         lpp^.nxtpage := tpp;
+         tpp^.prvpage := lpp;
+         tpp^.nxtpage := rpp;
+         rpp^.prvpage := tpp;
+         l := i;
+         lpp := tpp;
+      end;
+      for j := r to r + rc - 1 do begin { tail of line: right to left page }
+         lpp^.p[l] := rpp^.p[j];
+         l := l + 1;
+      end;
+      for j := l to pagemax do lpp^.p[j] := nul;
+      if l > 0 then
+         if lpp^.p[l - 1] <> Cr then
+            lpp^.p[l] := Cr;
+      m := pagemin;
+      if rpp^.p[r + rc] <> nul then begin { compact rest of right page }
+         for i := r + rc to pagemax do begin
+            rpp^.p[m] := rpp^.p[i];
+            m := m + 1;
+         end;
+         for i := m to pagemax do rpp^.p[i] := nul;
+      end
+      else begin { remove empty right page }
+         lpp^.nxtpage := rpp^.nxtpage;
+         if rpp^.nxtpage <> nil then
+            rpp^.nxtpage^.prvpage := lpp;
+         Rightpp := rpp^.nxtpage;
+         rpp^.nxtpage := nil;
+         FreeUp(rpp);
+      end;
+      if lpp^.p[pagemin] = nul then { empty left page }
+         if (lpp <> The.headlist^.nxtpage) or (lpp^.nxtpage <> nil) then begin
+            lpp^.prvpage^.nxtpage := lpp^.nxtpage;
+            if lpp^.nxtpage <> nil then
+               lpp^.nxtpage^.prvpage := lpp^.prvpage;
+            Leftpp := lpp^.nxtpage;
+            lpp^.nxtpage := nil;
+            FreeUp(lpp);
+         end;
+   end; { CutAcrossPage }
+
+begin { Cut }
+   if IsSelection then begin
+      TextRect(t);
+      FindLine(leftpp, leftndx, The.Select.Left.Ln);
+      FindLine(rightpp, rightndx, The.Select.Right.Ln);
+      markleft := MarkPos(leftpp, leftndx, The.Select.Left.Ch);
+      markright := MarkPos(rightpp, rightndx, The.Select.Right.Ch);
+      if The.Select.Left.Ch + (LineEnd(rightpp, rightndx) - rightndx - The.Select.Right.Ch) > 255 then begin
+         Error('Line would be too long (cut)');
+         FreeUp(junklist);
+         TotalKnt;
+         goto 200;
+      end;
+      { (MarkPos above has clamped the selection to real characters) }
+      if The.NumMarkers > 0 then CutMarks(The.Select, true);
+      FreeUp(junklist);
+      if The.Select.Left.Ln = The.Select.Right.Ln then begin { within one line }
+         if Visible(The.Select.Left.Ln) then begin
+            Diff := TextWidth(@leftpp^.p, markleft, markright - markleft);
+            cutinpage;
+            FindPoint(CutPt, The.Select.Left);
+            SetRect(t2, CutPt.h + The.Before, CutPt.v - The.Above,
+                        t.right, CutPt.v + The.Below);
+            ScrollRect(t2, - diff, 0, DummyRgn);
+            GenLine(Line, The.Select.Left.Ln);
+            SetRect(t2, t.right - Diff, CutPt.v - The.Above,
+                        t.right, CutPt.v + The.Below);
+            ClipRect(T2);
+            MoveTo(CutPt.h + The.Before, CutPt.v);
+            DrawText(@Line, The.Select.Left.Ch, Length(Line) - The.Select.Left.Ch + 1);
+            ClipToText;
+         end
+         else cutinpage;
+         SetInsertion(The.Select.Left);
+      end
+      else begin { more than one line }
+         if leftpp = rightpp then cutinpage
+         else cutacrosspage;
+         KntLines(leftpp, rightpp);
+         TotalKnt;
+         SetInsertion(The.Select.Left);
+         if The.Select.Left.Ln < The.DocPosn then InvalidPosn
+         else if The.Select.Left.Ln < The.DocPosn + The.LinesVis then
+            Repaint(The.Select.Left.Ln, The.LinesVis - (The.Select.Left.Ln - The.DocPosn));
+      end;
+200:
+      FixDocEnd;
+      The.Changed := True;
+   end;
+end; { Cut }
+
+{---------------------------- Copie ----------------------------}
+procedure Copie(var junklist: pageptr);
+var
+   leftpp, rightpp: pageptr;
+   leftndx, rightndx, markleft, markright: Integer;
+   LeftChSav, RightChSav: Integer;
+
+   procedure AbortCopy;
+   begin
+      Error(ConCat('Can''t Copy because ', OutOfMem));
+      FreeUp(junklist);
+      The.Select.Left.Ch := LeftChSav;
+      The.Select.Right.Ch := RightChSav;
+      Exit(Copie);
+   end;
+
+   procedure CopyInPage;
+   var
+      k, l: Integer;
+      pp: pageptr;
+   begin
+      if not NewPage(pp) then abortcopy;
+      pp^.nxtpage := nil;
+      junklist := pp;
+      l := pagemin;
+      with leftpp^ do begin
+         for k := markleft to markright - 1 do begin
+            pp^.p[l] := p[k];
+            l := l + 1;
+         end;
+         for k := l to pagemax do pp^.p[k] := nul;
+      end;
+      KntLines(pp, pp);
+   end;
+
+   procedure CopyAcrossPage;
+   var
+      i, l, m, r: Integer;
+      lpp, rpp, pp, qq, rr, ss, tt: pageptr;
+   begin
+      if not NewPage(pp) then abortcopy;
+      junklist := pp;
+      if not NewPage(qq) then abortcopy;
+      qq^.nxtpage := nil;
+      pp^.nxtpage := qq;
+      pp^.prvpage := nil;
+      l := markleft;
+      lpp := leftpp;
+      r := markright;
+      rpp := rightpp;
+      ss := pp;
+      rr := lpp^.nxtpage;
+      while rr <> rpp do begin
+         if not NewPage(tt) then abortcopy;
+         tt^ := rr^;
+         tt^.prvpage := ss;
+         ss^.nxtpage := tt;
+         ss := tt;
+         rr := rr^.nxtpage;
+      end;
+      ss^.nxtpage := qq;
+      qq^.prvpage := ss;
+      m := pagemin;
+      for i := l to pagemax do begin
+         pp^.p[m] := lpp^.p[i];
+         m := m + 1;
+      end;
+      for i := m to pagemax do pp^.p[i] := nul;
+      KntLines(pp, pp);
+      if r > 0 then begin
+         for i := pagemin to r - (1 - pagemin) do qq^.p[i] := rpp^.p[i];
+         for i := r + pagemin to pagemax do qq^.p[i] := nul;
+         KntLines(qq, qq);
+      end
+      else begin
+         ss^.nxtpage := nil;
+         FreeUp(qq);
+      end;
+   end;
+
+begin { Copie }
+   if IsSelection then begin
+      FindLine(leftpp, leftndx, The.Select.Left.Ln);
+      FindLine(rightpp, rightndx, The.Select.Right.Ln);
+      LeftChSav := The.Select.Left.Ch;
+      RightChSav := The.Select.Right.Ch;
+      markleft := MarkPos(leftpp, leftndx, The.Select.Left.Ch);
+      markright := MarkPos(rightpp, rightndx, The.Select.Right.Ch);
+      FreeUp(junklist);
+      if The.Select.Left.Ln = The.Select.Right.Ln then CopyInPage
+      else if leftpp = rightpp then CopyInPage
+      else CopyAcrossPage;
+      The.Select.Left.Ch := LeftChSav;
+      The.Select.Right.Ch := RightChSav;
+   end;
+end; { Copie }
+
+{---------------------------- SmallDelete ----------------------------}
+procedure SmallDelete(leftpp: pageptr; leftndx, Count: integer; InvertMargin: Boolean);
+var
+   I, Diff: integer;
+   T, T2: Rect;
+   Line: str;
+   DelPt: Point;
+   Gone: Range;
+begin
+   if The.NumMarkers > 0 then begin { markers later on the line move }
+      Gone.Right := The.Select.Left;
+      Gone.Left := The.Select.Left;
+      Gone.Left.Ch := Gone.Left.Ch - Count;
+      CutMarks(Gone, false);
+   end;
+   The.Select.Right := The.Select.Left;
+   The.Select.Left.Ch := The.Select.Left.Ch - Count;
+   if Visible(The.Select.Left.Ln) then
+      Diff := TextWidth(@leftpp^.p, leftndx - Count, Count);
+   for i := leftndx to pagemax do
+      leftpp^.p[i - Count] := leftpp^.p[i];
+   for i := pagemax - Count + 1 to pagemax do
+      leftpp^.p[i] := nul;
+   if Visible(The.Select.Left.Ln) then begin
+      TextRect(t);
+      FindPoint(DelPt, The.Select.Left);
+      SetRect(t2, DelPt.h + The.Before, DelPt.v - The.Above,
+                  t.right, DelPt.v + The.Below);
+      Scrollrect(t2, - Diff, 0, DummyRgn);
+      GenLine(Line, The.Select.Left.Ln);
+      SetRect(t2, t.right - Diff, DelPt.v - The.Above,
+                  t.right, DelPt.v + The.Below);
+      ClipRect(T2);
+      MoveTo(DelPt.h + The.Before, DelPt.v);
+      DrawText(@Line, The.Select.Left.Ch, Length(Line) - The.Select.Left.Ch + 1);
+      if InvertMargin then InvertRect(t2);
+      ClipToText;
+   end;
+   The.Select.Right := The.Select.Left;
+   The.Changed := True;
+end;
+
+{---------------------------- Deletion ----------------------------}
+{ The backspace key }
+procedure Deletion(Amount: Integer);
+label 61;
+var
+   leftndx, markleft, Count: Integer;
+   leftpp: pageptr;
+   DummyList: PagePtr;
+begin
+   MakeVisible;
+   if IsInsertion then begin
+      CaretVis(False);
+      while Amount > 0 do begin
+         FindLine(leftpp, leftndx, The.Select.Left.Ln);
+         markleft := MarkPos(leftpp, leftndx, The.Select.Left.Ch);
+         if The.Select.Left.Ch = 1 then
+            if The.Select.Left.Ln = 0 then goto 61 { start of document }
+            else begin { just past a CR: let Cut remove it }
+               The.Select.Left.Ln := The.Select.Left.Ln - 1;
+               The.Select.Left.Ch := MaxWidth + 1;
+               DummyList := nil;
+               Cut(DummyList);
+               FreeUp(DummyList);
+               Amount := Amount - 1;
+            end
+         else begin
+            Count := CMin(Amount, The.Select.Left.Ch - 1);
+            SmallDelete(Leftpp, MarkLeft, Count, False);
+            Amount := Amount - Count;
+         end;
+      end;
+61:
+   end;
+end;
+
+{---------------------------- AdjustLeft ----------------------------}
+procedure AdjustLeft;
+var
+   LeftNdx: Integer;
+   Leftpp: pageptr;
+   SavSelect: Range;
+begin
+   SavSelect := The.Select;
+   FindLine(Leftpp, LeftNdx, The.Select.Left.Ln);
+   LeftNdx := MarkPos(Leftpp, LeftNdx, The.Select.Left.Ch);
+   repeat
+      if Leftpp^.P[LeftNdx] = ' ' then begin
+         The.Select.Left.Ch := The.Select.Left.Ch + 1;
+         SmallDelete(Leftpp, LeftNdx + 1, 1, The.Select.Left.Ln < SavSelect.Right.Ln);
+         if The.Select.Left.Ln = SavSelect.Right.Ln then
+            SavSelect.Right.Ch := SavSelect.Right.Ch - 1;
+      end;
+      with Leftpp^ do
+         while (P[LeftNdx] <> CR) and (P[LeftNdx] <> Nul) do
+            LeftNdx := LeftNdx + 1;
+      if Leftpp^.P[LeftNdx] = CR then LeftNdx := LeftNdx + 1;
+      if Leftpp^.P[LeftNdx] = Nul then begin
+         Leftpp := Leftpp^.nxtpage;
+         LeftNdx := pagemin;
+         if Leftpp = nil then begin
+            The.Select := SavSelect;
+            exit(AdjustLeft);
+         end;
+      end;
+      The.Select.Left.Ln := The.Select.Left.Ln + 1;
+      The.Select.Left.Ch := 1;
+   until (The.Select.Left.LnCh >= SavSelect.Right.LnCh);
+   The.Select := SavSelect;
+end;
+
+
+{==============================================================================}
+{  Paste / Insert                                                             }
+{==============================================================================}
+
+{ Insert newpp between curpp and curpp^.nxtpage }
+procedure MergeAfter(curpp, newpp: pageptr);
+var
+   tmppp: pageptr;
+begin
+   tmppp := curpp^.nxtpage;
+   newpp^.nxtpage := tmppp;
+   newpp^.prvpage := curpp;
+   if tmppp <> nil then tmppp^.prvpage := newpp;
+   curpp^.nxtpage := newpp;
+end;
+
+{ count of all the chars in the list starting at pp }
+function KntChars(pp: pageptr): integer;
+var
+   i: integer;
+begin
+   if pp = nil then KntChars := 0
+   else if (pp^.nxtpage <> nil) or (pp^.p[pagemax] <> nul) then KntChars := pagemax + 1
+   else begin
+      i := 0;
+      with pp^ do
+         while p[i] <> nul do i := i + 1;
+      KntChars := i;
+   end;
+end;
+
+{ count of nul chars at the end of the page }
+function FreeChars(pp: pageptr): integer;
+var
+   i: integer;
+begin
+   if pp^.p[0] = nul then FreeChars := pagemax + 1
+   else begin
+      i := pagemax;
+      with pp^ do
+         while p[i] = nul do i := i - 1;
+      FreeChars := pagemax - i;
+   end;
+end;
+
+procedure Copy1KChars(pp: pageptr; qq: pageptr; chx: integer);
+var
+   i: integer;
+begin
+   while pp <> nil do begin
+      if pp^.p[pagemax] <> nul then
+         for i := PageMin to pagemax do begin
+            qq^.p[chx] := pp^.p[i];
+            chx := chx + 1;
+         end
+      else begin
+         i := PageMin;
+         while pp^.p[i] <> nul do begin
+            qq^.p[chx] := pp^.p[i];
+            chx := chx + 1;
+            i := i + 1;
+         end;
+      end;
+      pp := pp^.nxtpage;
+   end;
+end;
+
+procedure OpenGap(size, fb: integer; pp: pageptr; chx: integer);
+var
+   i, src, dst, knt: integer;
+begin
+   src := pagemax - fb;
+   dst := src + size;
+   knt := src - chx + 1;
+   with pp^ do
+      for i := 0 to knt - 1 do
+         p[dst - i] := p[src - i];
+end;
+
+function BreakPg(fullpp: pageptr; start: integer): Boolean;
+var
+   newpp: pageptr;
+   i: integer;
+begin
+   if not NewPage(newpp) then begin
+      error(ConCat('Can''t Paste because ', OutOfMem));
+      BreakPg := False;
+      Exit(BreakPg);
+   end;
+   MergeAfter(fullpp, newpp);
+   with Fullpp^ do
+      for i := 0 to (pagemax - start) do begin
+         newpp^.p[i] := P[start + i];
+         P[start + i] := nul;
+      end;
+   with Newpp^ do
+      for i := (pagemax - start + 1) to pagemax do
+         P[i] := nul;
+   BreakPg := True;
+end;
+
+function LineBegin{(pp: pageptr; ndx: integer): integer};
+label 3;
+begin
+   with pp^ do
+      while ndx > pagemin do begin
+         if p[ndx] = cr then goto 3;
+         ndx := ndx - 1;
+      end;
+3:
+   LineBegin := ndx;
+end;
+
+function LineEnd{(pp: pageptr; ndx: integer): integer};
+label 3;
+begin
+   with pp^ do
+      while ndx < pagemax do begin
+         if p[ndx] = nul then goto 3;
+         if p[ndx] = cr then begin
+            ndx := ndx + 1;
+            goto 3;
+         end;
+         ndx := ndx + 1;
+      end;
+3:
+   LineEnd := ndx;
+end;
+
+function PasteChars(srcpp, destpp: pageptr; begline, destndx: integer): Boolean;
+var
+   i, linesize, freebytes: integer;
+   srcndx: integer;
+   startpp: pageptr;
+begin
+   PasteChars := False;
+   startpp := destpp;
+   freebytes := FreeChars(destpp);
+   while srcpp <> nil do begin
+      srcndx := PageMin;
+      while srcpp^.p[srcndx] <> nul do begin
+         linesize := LineEnd(srcpp, srcndx) - srcndx;
+         if linesize >= freebytes then
+            if destndx > (pagemax div 2) then begin { break at beginning of line }
+               if not BreakPg(destpp, begline) then Exit(PasteChars);
+               destpp := destpp^.nxtpage;
+               destndx := destndx - begline;
+               freebytes := freebytes + begline;
+            end
+            else begin { break at end of current line }
+               if not BreakPg(destpp, LineEnd(destpp, destndx)) then Exit(PasteChars);
+               kntlines(destpp^.nxtpage, destpp^.nxtpage);
+               freebytes := pagemax - LineEnd(destpp, destndx) + 1;
+            end;
+         if destpp^.p[destndx] <> nul then
+            OpenGap(linesize, freebytes, destpp, destndx);
+         for i := 0 to linesize - 1 do
+            destpp^.p[destndx + i] := srcpp^.p[srcndx + i];
+         destndx := destndx + linesize;
+         begline := destndx;
+         srcndx := srcndx + linesize;
+         freebytes := freebytes - linesize;
+      end;
+      srcpp := srcpp^.nxtpage;
+   end;
+   if (destpp^.p[destndx] = nul) and (destpp^.p[destndx - 1] <> cr) then
+      destpp^.p[destndx] := cr;
+   kntlines(startpp, destpp);
+   PasteChars := True;
+end;
+
+{---------------------------- Paste ----------------------------}
+procedure Paste(charslist: pageptr);
+label 300;
+var
+   leftpp: pageptr;
+   t, t2: rect;
+   OldLeftLn, freebytes, charssize, Diff: integer;
+   NewLeft: Place;
+   leftndx, markleft: integer;
+   PastePt: Point;
+   NumLns, NumChs, k: integer;
+   pp: PagePtr;
+
+   { true if the new caret is on the same line; NewLeft := new caret }
+   function SmallPaste(pp: pageptr): boolean;
+   var
+      i: integer;
+   begin
+      NewLeft := The.Select.Left;
+      repeat
+         i := 0;
+         with pp^ do
+            while (i <= pagemax) and (p[i] <> nul) do begin
+               if p[i] = cr then begin
+                  NewLeft.Ln := NewLeft.Ln + 1;
+                  NewLeft.Ch := 1;
+               end
+               else NewLeft.Ch := NewLeft.Ch + 1;
+               i := i + 1;
+            end;
+         pp := pp^.nxtpage;
+      until pp = nil;
+      SmallPaste := (NewLeft.Ln = The.Select.Left.Ln);
+   end;
+
+   function LineIsTooLong: boolean;
+   var
+      DstBefore, DstAfter, SrcFirst, SrcLast: integer;
+      temppp: PagePtr;
+   begin
+      LineIsTooLong := false;
+      DstBefore := The.Select.Left.Ch;
+      SrcFirst := LineEnd(CharsList, PageMin);
+      if DstBefore + SrcFirst > 255 then begin
+         LineIsTooLong := true;
+         exit(LineIsTooLong);
+      end;
+      DstAfter := LineEnd(leftpp, leftndx) - leftndx - The.Select.Left.Ch;
+      if (CharsList^.nxtpage = nil) and (CharsList^.linesinp = 0) then begin
+         if DstBefore + CharsSize + DstAfter > 255 then LineIsTooLong := true;
+      end
+      else begin
+         temppp := CharsList;
+         while temppp^.nxtpage <> nil do temppp := temppp^.nxtpage;
+         SrcLast := KntChars(Temppp);
+         SrcLast := SrcLast - LineBegin(temppp, SrcLast);
+         if SrcLast + DstAfter > 255 then LineIsTooLong := true;
+      end;
+   end;
+
+begin { Paste }
+   if IsInsertion and (CharsList <> nil) then begin
+      caretvis(false);
+      FindLine(leftpp, leftndx, The.Select.Left.Ln);
+      markleft := markpos(leftpp, leftndx, The.Select.Left.Ch);
+      charssize := KntChars(charslist);
+      freebytes := FreeChars(leftpp);
+
+      if LineIsTooLong then begin
+         warning('Line would be too long (Paste)');
+         goto 300;
+      end;
+
+      if The.NumMarkers > 0 then begin { markers after the insertion move }
+         NumLns := 0;
+         NumChs := 0;
+         pp := charslist;
+         while pp <> nil do begin
+            k := pagemin;
+            while (k <= pagemax) and (pp^.p[k] <> nul) do begin
+               if pp^.p[k] = cr then begin
+                  NumLns := NumLns + 1;
+                  NumChs := 0;
+               end
+               else NumChs := NumChs + 1;
+               k := k + 1;
+            end;
+            pp := pp^.nxtpage;
+         end;
+         PasteMarks(The.Select.Left, NumLns, NumChs);
+      end;
+
+      if charssize <> 0 then begin
+         if charssize + 1 < freebytes then begin { fits in this page }
+            if leftpp^.p[markleft] <> nul then
+               OpenGap(charssize, freebytes, leftpp, markleft);
+            Copy1KChars(charslist, leftpp, markleft);
+            { at the end of the text the inserted line must end with a CR }
+            if (leftpp^.p[markleft + charssize] = nul) and
+               (leftpp^.p[markleft + charssize - 1] <> cr) then
+               leftpp^.p[markleft + charssize] := cr;
+            KntLines(leftpp, leftpp);
+         end
+         else { have to move something to the next page }
+            if not PasteChars(charslist, leftpp, leftndx, markleft) then begin
+               TotalKnt;
+               goto 300;
+            end;
+         TotalKnt;
+         textrect(t);
+         if SmallPaste(charslist) then begin
+            if Visible(The.Select.Left.Ln) then begin
+               FindPoint(PastePt, The.Select.Left);
+               setrect(t2, PastePt.h + The.Before, PastePt.v - The.Above,
+                           t.right, PastePt.v + The.Below);
+               Diff := TextWidth(@CharsList^.p, 0, CharsSize);
+               Scrollrect(t2, Diff, 0, DummyRgn);
+               moveto(PastePt.h + The.Before, PastePt.v);
+               drawtext(@CharsList^.p, 0, CharsSize);
+            end;
+            SetInsertion(NewLeft);
+         end
+         else begin
+            OldLeftln := The.Select.Left.Ln;
+            SetInsertion(NewLeft);
+            if OldLeftLn < The.DocPosn then
+               The.DocPosn := The.DocPosn + (NewLeft.Ln - OldLeftLn)
+            else if OldLeftLn < The.DocPosn + The.LinesVis then
+               Repaint(OldLeftLn, The.LinesVis - (OldLeftLn - The.DocPosn));
+         end;
+      end;
+300:
+      The.Changed := True;
+   end;
+end; { Paste }
+
+{---------------------------- Insertion ----------------------------}
+procedure Insertion(var chrs: pagebuf; ChrCount: Integer);
+label 21;
+var
+   i, j, k: integer;
+   Line: Str;
+   NewLeft: Place;
+begin
+   MakeVisible;
+   NewLeft := The.Select.Left;
+   j := 0;
+   InsertPg^.LinesInP := 0;
+   with InsertPg^ do
+      for i := 0 to ChrCount - 1 do
+         if j < pagemax - 300 then
+            if chrs[i] = tab then begin
+               for k := 1 to (The.TabsIncr - (NewLeft.Ch - 1) mod The.TabsIncr) do begin
+                  p[j] := ' ';
+                  j := j + 1;
+                  NewLeft.Ch := NewLeft.Ch + 1;
+               end;
+            end
+            else if chrs[i] = cr then begin { auto-indent new line }
+               GenLine(Line, The.Select.Left.Ln);
+               p[j] := cr;
+               j := j + 1;
+               NewLeft.Ln := NewLeft.Ln + 1;
+               NewLeft.Ch := 1;
+               for K := 1 to CMin(Length(Line), The.Select.Left.Ch - 1) do begin
+                  if (Line[K] <> ' ') then goto 21;
+                  p[j] := ' ';
+                  j := j + 1;
+                  NewLeft.Ch := NewLeft.Ch + 1;
+               end;
+21:
+               LinesInP := LinesInP + 1;
+            end
+            else if chrs[i] = EnterCh then begin { plain new line }
+               p[j] := cr;
+               j := j + 1;
+               NewLeft.Ln := NewLeft.Ln + 1;
+               NewLeft.Ch := 1;
+               LinesInP := LinesInP + 1;
+            end
+            else begin
+               p[j] := chrs[i];
+               j := j + 1;
+               NewLeft.Ch := NewLeft.Ch + 1;
+            end;
+   Paste(InsertPg);
+   with InsertPg^ do
+      for k := 0 to j - 1 do p[k] := nul;
+   InsertPg^.LinesInP := 0;
+end;
+
+{---------------------------- AdjustRight ----------------------------}
+procedure AdjustRight;
+var
+   SavSelect: Range;
+   PrePaste, PostPaste: Point;
+   T: Rect;
+begin
+   SavSelect := The.Select;
+   InsertPg^.p[0] := ' ';
+   InsertPg^.LinesInP := 0;
+   TextRect(T);
+   with The.Select do
+      repeat
+         Right := Left;
+         FindPoint(PrePaste, Left);
+         Paste(InsertPg);
+         if Visible(Left.Ln) then begin
+            PrePaste.H := PrePaste.H + The.Before;
+            PostPaste.V := PrePaste.V;
+            PostPaste.H := PrePaste.H + The.SpaceW;
+            InvText(T, PrePaste, PostPaste);
+         end;
+         if Left.Ln = SavSelect.Right.Ln then
+            SavSelect.Right.Ch := SavSelect.Right.Ch + 1;
+         Left.Ln := Left.Ln + 1;
+         Left.Ch := 1;
+      until (Left.LnCh >= SavSelect.Right.LnCh);
+   InsertPg^.p[0] := Nul;
+   The.Select := SavSelect;
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  Fonts (the Type Style menu: style + size)                                 }
+{==============================================================================}
+
+{$S LTEMisc }
+
+{ Compute metrics of the font for the text; make it the port's font }
+function OpenMainFont(TheFamily: integer): integer;
+var
+   FontId: TLFntId;
+   FInfo: FontInfo;
+   FontWidths: THMpccWid;
+   ExtraWidth: TB;
+   ErrNum: integer;
+begin
+   FontId.Fam := TheFamily;
+   FontId.SetEFace := [];
+   FontId.Dev := DevScreen;
+   if FMFontMetrics(FontId, FInfo, ErrNum) then
+      if FMFontWidths(FontId, FontWidths, ExtraWidth, ErrNum) then begin
+         The.FontId := FontId;
+         TextFont(The.FontId.Fam);
+         TextFace([]);
+         with FInfo do begin
+            The.HorzSp := WidMax;
+            The.VertSp := Leading + Ascent + Descent;
+            The.Below := Descent + Leading div 2;
+            The.Above := The.VertSp - The.Below;
+         end;
+         The.Before := 1;
+         The.After := 0;
+         The.SpaceW := FontWidths^^[Ord(' ')] + ExtraWidth;
+      end;
+   OpenMainFont := ErrNum;
+end;
+
+function FamilyOf(TheStyle, TheSize: integer): integer;
+var
+   TheFamily: integer;
+begin
+   TheFamily := p12Tile;
+   if TheStyle = FClassic then
+      case TheSize of
+         F8Pt20Pitch:  TheFamily := p20Tile;
+         F8Pt15Pitch:  TheFamily := p15Tile;
+         F10Pt12Pitch: TheFamily := p12cent;
+         F12Pt10Pitch: TheFamily := p10cent;
+         F12PtPS:      TheFamily := Cent12;
+         F18PtPS:      TheFamily := Cent18;
+         otherwise     TheFamily := p12cent;
+      end
+   else
+      case TheSize of
+         F8Pt20Pitch:  TheFamily := p20Tile;
+         F8Pt15Pitch:  TheFamily := p15Tile;
+         F10Pt12Pitch: TheFamily := p12Tile;
+         F12Pt10Pitch: TheFamily := p10tile;
+         F12PtPS:      TheFamily := Tile12;
+         F18PtPS:      TheFamily := Tile18;
+         otherwise     TheFamily := p12Tile;
+      end;
+   FamilyOf := TheFamily;
+end;
+
+{ map a font family (from a .TEXT header) back to the menu items }
+procedure StyleOf(Fam: integer; var TheStyle, TheSize: integer);
+begin
+   TheStyle := MainFStyle;
+   TheSize := MainFSize;
+   if Fam = P20Tile then TheSize := F8Pt20Pitch
+   else if Fam = P15Tile then TheSize := F8Pt15Pitch
+   else if Fam = P12Tile then TheSize := F10Pt12Pitch
+   else if Fam = P12Cent then begin TheSize := F10Pt12Pitch; TheStyle := FClassic end
+   else if Fam = P10Tile then TheSize := F12Pt10Pitch
+   else if Fam = P10Cent then begin TheSize := F12Pt10Pitch; TheStyle := FClassic end
+   else if Fam = Tile12 then TheSize := F12PtPS
+   else if Fam = Cent12 then begin TheSize := F12PtPS; TheStyle := FClassic end
+   else if Fam = Tile18 then TheSize := F18PtPS
+   else if Fam = Cent18 then begin TheSize := F18PtPS; TheStyle := FClassic end;
+end;
+
+{ Make The.FontStyle/FontSize the window's font; fall back to the default }
+procedure UseDocFont;
+begin
+   if OpenMainFont(FamilyOf(The.FontStyle, The.FontSize)) <> 0 then begin
+      The.FontStyle := MainFStyle;
+      The.FontSize := MainFSize;
+      if OpenMainFont(FamilyOf(MainFStyle, MainFSize)) <> 0 then
+         if OpenMainFont(SysText) <> 0 then ;
+   end;
+end;
+
+procedure RefreshMenuState; forward;
+
+{ change font to TheStyle/TheSize and redisplay }
+procedure ChangeFont(TheStyle, TheSize: integer);
+var
+   r: Rect;
+begin
+   if (TheStyle = The.FontStyle) and (TheSize = The.FontSize) then exit(ChangeFont);
+   if OpenMainFont(FamilyOf(TheStyle, TheSize)) <> 0 then begin
+      Error('Can''t find that font');
+      exit(ChangeFont);
+   end;
+   CaretVis(false);
+   ClipRect(theFolder^.PortRect);
+   TextRect(r);
+   r.Left := r.Left - MarginW;   { the margin too: its width follows the font }
+   EraseRect(r);
+   The.FontStyle := TheStyle;
+   The.FontSize := TheSize;
+   Recompute;
+   ClipToText;
+   PaintDoc(CMin(The.DocPosn, MaxPosn));
+   PaintElev(CalcElevPosn(The.DocPosn));
+   The.Changed := true;
+   RefreshMenuState;
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  Search                                                                     }
+{==============================================================================}
+
+{$S LTESrch }
+
+function SetTarget: Boolean;
+var
+   Response, CurSelect: Str;
+begin
+   GetSelString(CurSelect, 40);
+   PromptBox('Find what ?', CurSelect);
+   SetTarget := False;
+   if GetReply(Response) then begin
+      if Response = '' then Target := CurSelect
+      else Target := Response;
+      SetTarget := length(Target) > 0;
+   end;
+   HideTheBox;
+end;
+
+function Match(Matchpp: pageptr; Matchndx: Integer; var Pattern: Str; Prefix: Boolean): Boolean;
+var
+   Ndx, I: Integer;
+   Ch: Char;
+begin
+   Match := False;
+   Ndx := Matchndx + 1; { first char already tested }
+   for I := 2 to Length(Pattern) do begin
+      Ch := Matchpp^.p[Ndx];
+      if not MatchCase then
+         if Ch >= 'a' then
+            if Ch <= 'z' then
+               Ch := Chr(Ord(Ch) - 32);
+      if Ch <> Pattern[I] then Exit(Match)
+      else Ndx := Ndx + 1;
+   end;
+   if not TokenMode then begin
+      Match := True;
+      Exit(Match);
+   end;
+   if (Pattern[1] in AlphaNum) then
+      if Matchndx > 0 then
+         if (Matchpp^.p[Matchndx - 1] in AlphaNum) then Exit(Match);
+   if not Prefix then
+      if (Pattern[Length(Pattern)] in AlphaNum) then
+         if (Matchpp^.p[Ndx] in AlphaNum) then Exit(Match);
+   Match := True;
+end;
+
+function FindNext: Boolean;
+var
+   Markpp: pageptr;
+   Mark, MarkEnd: Place;
+   Pat: Str;
+   PatCh1, PatLCh1, Ch: Char;
+   Prefix, Wrapped: Boolean;
+   StartLine, I, Markndx: integer;
+begin
+   FindNext := False;
+   Pat := Target;
+   if length(Pat) = 0 then exit(FindNext);
+   if not MatchCase then UpStr(Pat);
+   PatCh1 := Pat[1];
+   if (not MatchCase) and (PatCh1 >= 'A') and (PatCh1 <= 'Z') then
+      PatLCh1 := Chr(Ord(PatCh1) + 32)
+   else PatLCh1 := PatCh1;
+   if TokenMode and (Length(Pat) >= 8) then begin
+      PreFix := True;
+      for I := Length(Pat) - 7 to Length(Pat) do
+         if not (Pat[I] in AlphaNum) then PreFix := False;
+   end
+   else PreFix := False;
+   Wrapped := false;
+   Mark := The.Select.Right;
+   StartLine := Mark.Ln;
+   FindLine(Markpp, Markndx, Mark.Ln);
+   Markndx := markpos(Markpp, Markndx, Mark.Ch);
+   while true do begin
+      if WrapSearch then begin
+         if Wrapped and (StartLine <= Mark.ln) then exit(FindNext);
+      end
+      else if Markpp = nil then exit(FindNext);
+      if Markpp = nil then exit(FindNext);
+      Ch := Markpp^.p[Markndx];
+      if Ch = cr then begin
+         Mark.Ln := Mark.Ln + 1;
+         Mark.Ch := 1;
+         Markndx := Markndx + 1;
+      end
+      else if (Ch = nul) or (Markndx >= pagemax) then begin
+         if Markpp^.nxtpage <> nil then
+            if Markndx > pagemin then
+               if Markpp^.p[Markndx - 1] <> cr then Mark.Ln := Mark.Ln + 1;
+         Markpp := Markpp^.nxtpage;
+         Markndx := PageMin;
+         if (Markpp = nil) and WrapSearch then begin
+            if Wrapped then exit(FindNext);
+            Mark.Ln := 0;
+            Mark.Ch := 1;
+            FindLine(Markpp, Markndx, 0);
+            Wrapped := true;
+         end;
+      end
+      else begin { ordinary character }
+         if (Ch = PatCh1) or (Ch = PatLCh1) then
+            if Match(Markpp, Markndx, Pat, Prefix) then begin { found it }
+               I := Markndx + Length(Pat);
+               if Prefix then
+                  with Markpp^ do
+                     while P[I] in AlphaNum do I := I + 1;
+               MarkEnd.Ln := Mark.Ln;
+               MarkEnd.Ch := Mark.Ch + (I - Markndx);
+               SetSelection(Mark, MarkEnd);
+               FindNext := True;
+               Exit(FindNext);
+            end;
+         Mark.Ch := Mark.Ch + 1;
+         Markndx := Markndx + 1;
+      end;
+   end;
+end; { FindNext }
+
+procedure SayNotFound;
+var
+   Tgt: Str;
+begin
+   if Length(Target) < 35 then Tgt := Target
+   else Tgt := Concat(Copy(Target, 1, 30), ' ...');
+   Warning(ConCat('"', Tgt, '" not found'));
+   HideTheBox;
+end;
+
+procedure Find;
+begin
+   if Length(Target) > 0 then begin
+      if IsInsertion then CaretVis(False);
+      if not FindNext then SayNotFound;
+   end;
+   MakeVisible;
+end;
+
+procedure DoFind(Doing: Boolean; WhichCmd: Cmds);
+var
+   PrevTarget: Str;
+begin
+   PrevTarget := Target;
+   if Doing then begin
+      if (WhichCmd <> CmdFind) and (Length(Target) > 0) then
+         { we already have a search string }
+      else if not SetTarget then begin
+         StartCmd(WhichCmd, False);
+         Exit(DoFind);
+      end;
+   end
+   else Target := Last.Target;
+   StartCmd(WhichCmd, True);
+   Last.Target := PrevTarget;
+   Last.Start := The.Select;
+   Find;
+end;
+
+procedure UndoFind;
+var
+   PrevTarget: Str;
+begin
+   StartCmd(CmdUndo, True);
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   if IsInsertion then CaretVis(False);
+   The.Select := Last.Start;
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   PrevTarget := Target;
+   Target := Last.Target;
+   Last.Target := PrevTarget;
+   MakeVisible;
+end;
+
+{ Find & Paste All: replace every occurrence of the target with the clipboard }
+procedure DoFindAll;
+label 99;
+var
+   Verify, IsFirstTime: Boolean;
+   DummyList: PagePtr;
+
+   function GetYNS(Message: str255): boolean;
+   var
+      Ch: Char;
+      OK: boolean;
+
+      procedure DoBye;
+      begin
+         HideTheBox;
+         Exit(DoFindAll);
+      end;
+
+   begin
+      DrawTheBox(concat(Message, '? (Yes, No, or Stop) '));
+      repeat
+         OK := true;
+         if not ReadCh(ch) then DoBye;
+         case ch of
+            'S', 's': DoBye;
+            'Y', 'y': GetYNS := True;
+            'N', 'n': GetYNS := false;
+            otherwise OK := false;
+         end;
+      until OK;
+   end;
+
+begin
+   StartCmd(CmdFindAll, False);
+   MakeVisible;
+   if Length(Target) = 0 then
+      if not SetTarget then Exit(DoFindAll);
+   if scraplist = nil then begin
+      Warning('The clipboard is empty: Copy the replacement text first');
+      HideTheBox;
+      Exit(DoFindAll);
+   end;
+   if Confirm('Verify each substitution') then Verify := true
+   else begin
+      if ClickOut then Exit(DoFindAll);
+      if not Confirm('You cannot undo "Find & Paste All".  Proceed anyway') then Exit(DoFindAll);
+      Verify := false;
+   end;
+
+   DummyList := nil;
+   if IsInsertion then CaretVis(False);
+   IsFirstTime := true;
+
+   while FindNext do begin
+      IsFirstTime := false;
+      if Verify then begin
+         MakeVisible;
+         if GetYNS('Substitute ') then begin
+            Cut(DummyList);
+            Freeup(DummyList);
+            Paste(Scraplist);
+            Repaint(The.Select.Left.Ln, 1);
+         end;
+      end
+      else begin
+         if abortflag then goto 99;
+         Cut(DummyList);
+         Freeup(DummyList);
+         Paste(Scraplist);
+         Repaint(The.Select.Left.Ln, 1);
+      end;
+   end;
+
+   if IsFirstTime then SayNotFound;
+   if verify then HideTheBox;
+99:
+   MakeVisible;
+end;
+
+{ The three search switches are check-marked menu items.  Each toggle }
+{ is undoable.                                                        }
+procedure DoToken;
+begin
+   StartCmd(CmdToken, True);
+   TokenMode := not TokenMode;
+   CheckItem(myMenus[mSearch], miWords, TokenMode);
+end;
+
+procedure DoCase;
+begin
+   StartCmd(CmdCase, True);
+   MatchCase := not MatchCase;
+   CheckItem(myMenus[mSearch], miCase, MatchCase);
+end;
+
+procedure DoWrap;
+begin
+   StartCmd(CmdWrap, True);
+   WrapSearch := not WrapSearch;
+   CheckItem(myMenus[mSearch], miWrap, WrapSearch);
+end;
+
+procedure DoGoTo;
+var
+   GoToLine: integer;
+   Spot: Place;
+   S: Str;
+begin
+   StartCmd(CmdGoTo, true);
+   Last.GoSel := The.Select;
+   Last.GoPosn := The.DocPosn;
+   GotoLine := The.Select.Left.Ln + 1;
+   NumToStr(GotoLine, S);
+   DrawTheBox(concat('Go to which line ? [', s, '] '));
+   if GetNumber(GoToLine, true) then begin
+      if (GoToLine > The.linestot + 1) or (GoToLine <= 0) then
+         warning('Line number out of range')
+      else begin
+         Spot.Ch := 1;
+         Spot.Ln := GoToLine - 1;
+         SetSelection(Spot, Spot);
+         MakeVisible;
+         CaretVis(true);
+      end;
+   end;
+   HideTheBox;
+end;
+
+procedure UndoGoto;
+var
+   tempPosn: integer;
+   TempSelection: range;
+begin
+   StartCmd(CmdUndo, true);
+   TempSelection := The.Select;
+   if IsInsertion then CaretVis(false);
+   SetSelection(Last.GoSel.Left, Last.GoSel.Right);
+   Last.GoSel := TempSelection;
+   tempPosn := The.DocPosn;
+   The.DocPosn := Last.GoPosn;
+   Last.GoPosn := tempPosn;
+   Repaint(The.DocPosn, The.LinesVis);
+   UpdateElev(CalcElevPosn(The.DocPosn));
+end;
+
+procedure DoShowCursor;
+begin
+   StartCmd(CmdCurrent, true);
+   Last.DocPosn := The.DocPosn;
+   MakeVisible;
+   CaretVis(true);
+end;
+
+procedure UndoShowCursor;
+begin
+   StartCmd(CmdUndo, true);
+   The.DocPosn := Last.DocPosn;
+   Repaint(The.DocPosn, The.LinesVis);
+   UpdateElev(CalcElevPosn(The.DocPosn));
+end;
+
+{==============================================================================}
+{  Markers.  "Go to Marker" asks for a name (the markers are not listed as  }
+{  menu items, so the menu never changes at run time); Return alone goes to  }
+{  the next marker.                                                          }
+{==============================================================================}
+
+{ index of the marker called Name (case does not matter), 0 if none }
+function FindMark(Name: str): integer;
+var
+   i: integer;
+   a: str;
+begin
+   FindMark := 0;
+   UpStr(Name);
+   for i := 1 to The.NumMarkers do begin
+      a := The.Markers[i].name;
+      UpStr(a);
+      if a = Name then begin
+         FindMark := i;
+         exit(FindMark);
+      end;
+   end;
+end;
+
+{ Markers/Set Marker ...: name the current selection.  The default name is }
+{ the selected text; an existing name is moved to the selection.           }
+procedure SetMarker;
+var
+   Response, MarkName: str;
+   i: integer;
+begin
+   StartCmd(CmdNone, false);
+   GetSelString(MarkName, MarkStrLen);
+   PromptBox('Set marker named ?', MarkName);
+   if GetReply(Response) then begin
+      if length(Response) = 0 then Response := MarkName;
+      TrimStr(Response);
+      if length(Response) > MarkStrLen then Response[0] := chr(MarkStrLen);
+      if length(Response) > 0 then begin
+         i := FindMark(Response);
+         if i = 0 then
+            if The.NumMarkers >= MarkerMax then
+               Warning('There can be no more than 18 markers')
+            else begin
+               The.NumMarkers := The.NumMarkers + 1;
+               i := The.NumMarkers;
+               The.Markers[i].name := Response;
+            end;
+         if i > 0 then begin
+            The.Markers[i].p := The.Select;
+            The.Changed := true;
+         end;
+      end;
+   end;
+   HideTheBox;
+end;
+
+{ Markers/Delete Marker ...: the default is the marker of the selection }
+procedure DeleteMarker;
+var
+   Response, DefName: str;
+   i, j: integer;
+begin
+   StartCmd(CmdNone, false);
+   DefName := '';
+   for i := 1 to The.NumMarkers do
+      if (The.Markers[i].p.Left.LnCh = The.Select.Left.LnCh) and
+         (The.Markers[i].p.Right.LnCh = The.Select.Right.LnCh) then
+         DefName := The.Markers[i].name;
+   PromptBox('Delete marker named ?', DefName);
+   if GetReply(Response) then begin
+      if length(Response) = 0 then Response := DefName;
+      TrimStr(Response);
+      i := FindMark(Response);
+      if i > 0 then begin
+         for j := i to The.NumMarkers - 1 do The.Markers[j] := The.Markers[j + 1];
+         The.NumMarkers := The.NumMarkers - 1;
+         The.Changed := true;
+      end
+      else if length(Response) > 0 then
+         Warning(concat('There is no marker named "', Response, '"'));
+   end;
+   HideTheBox;
+end;
+
+{ Markers/Go to Marker ...: select a marked range (undoable, like Go to  }
+{ Line).  The prompt lists the markers; the default is the next marker  }
+{ after the selection, so repeated Return walks through them in order.   }
+procedure GoToMarker;
+var
+   Response, DefName, List: str;
+   i, best, first: integer;
+   Spot: Range;
+begin
+   if The.NumMarkers = 0 then exit(GoToMarker);
+   best := 0;
+   first := 1;
+   for i := 1 to The.NumMarkers do begin
+      if The.Markers[i].p.Left.LnCh < The.Markers[first].p.Left.LnCh then first := i;
+      if The.Markers[i].p.Left.LnCh > The.Select.Left.LnCh then
+         if best = 0 then best := i
+         else if The.Markers[i].p.Left.LnCh < The.Markers[best].p.Left.LnCh then best := i;
+   end;
+   if best = 0 then best := first;   { past the last one: wrap around }
+   DefName := The.Markers[best].name;
+   List := '';
+   for i := 1 to The.NumMarkers do
+      if length(List) < 150 then begin
+         if length(List) > 0 then List := concat(List, ', ');
+         List := concat(List, The.Markers[i].name);
+      end;
+   PromptBox(concat('Go to marker (', List, ') ?'), DefName);
+   if GetReply(Response) then begin
+      if length(Response) = 0 then Response := DefName;
+      TrimStr(Response);
+      i := FindMark(Response);
+      if i = 0 then Warning(concat('There is no marker named "', Response, '"'))
+      else begin
+         StartCmd(CmdGoTo, true);
+         Last.GoSel := The.Select;
+         Last.GoPosn := The.DocPosn;
+         Spot := The.Markers[i].p;
+         if IsInsertion then CaretVis(false);
+         SetSelection(Spot.Left, Spot.Right);
+         MakeVisible;
+         if IsInsertion then CaretVis(true);
+      end;
+   end;
+   HideTheBox;
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  Workshop .TEXT files                                                        }
+{==============================================================================}
+
+{$S LTEFile }
+
+function IOFail(Operation: Str255; Result: integer; Incomplete: Boolean): Boolean;
+var
+   Num: str;
+begin
+   if (Result > 0) or Incomplete then begin
+      if Result > 0 then begin
+         NumToStr(Result, Num);
+         Error(ConCat('OS error ', Num, ' while ', Operation));
+      end
+      else Error(ConCat('Incomplete data transfer while ', Operation));
+      IOFail := True;
+   end
+   else IOFail := false;
+end;
+
+{ Default ".TEXT" suffix }
+function CheckTitle(var title: FileStr): Boolean;
+var
+   up: str;
+begin
+   CheckTitle := false;
+   TrimStr(title);
+   if length(title) = 0 then exit(CheckTitle);
+   up := title;
+   UpStr(up);
+   if length(up) < 5 then title := concat(title, '.TEXT')
+   else if copy(up, length(up) - 4, 5) <> '.TEXT' then title := concat(title, '.TEXT');
+   if length(title) > 66 then begin
+      Error('That file name is too long');
+      exit(CheckTitle);
+   end;
+   CheckTitle := true;
+end;
+
+function InFileName(Message: Str255; var FileName: FileStr): Boolean;
+var
+   Response, DefName: Str;
+begin
+   InFileName := false;
+   if The.HasFile then DefName := The.FileName else DefName := '';
+   repeat
+      PromptBox(Message, DefName);
+      if not GetReply(Response) then Exit(InFileName);
+      if length(Response) = 0 then Response := DefName;
+      FileName := Response;
+      if FileName = '' then Exit(InFileName);
+   until CheckTitle(FileName);
+   InFileName := True;
+end;
+
+function OutFileName(Message: Str255; var FileName: FileStr): Boolean;
+var
+   Response, DefName: Str;
+   TheFile: phyle;
+   res: integer;
+begin
+   if The.HasFile then DefName := The.FileName else DefName := '';
+   repeat
+      OutFileName := false;
+      PromptBox(Message, DefName);
+      if not GetReply(Response) then Exit(OutFileName);
+      if length(Response) = 0 then Response := DefName;
+      FileName := Response;
+      if FileName = '' then Exit(OutFileName);
+   until CheckTitle(FileName);
+
+   BeginIO;
+   {$I- }
+   Reset(TheFile, FileName);
+   {$I+ }
+   res := IOResult;
+   if res <= 0 then Close(TheFile);
+   EndIO;
+   if res <> FileNotFound then begin
+      if IOFail('opening', res, false) then Exit(OutFileName);
+      if not Confirm(ConCat('Replace existing "', FileName, '"')) then Exit(OutFileName);
+   end;
+   OutFileName := True;
+end;
+
+function OpenInFile(FileName: FileStr; var TheFile: phyle): Boolean;
+var res: integer;
+begin
+   BeginIO;
+   {$I- }
+   Reset(TheFile, FileName);
+   {$I+ }
+   res := IOResult;
+   EndIO;
+   OpenInFile := not IOFail('opening', res, false);
+end;
+
+function OpenOutFile(FileName: FileStr; var TheFile: phyle): Boolean;
+var res: integer;
+begin
+   BeginIO;
+   {$I- }
+   Reset(TheFile, FileName);
+   res := IOResult;
+   if res > 0 then begin
+      Rewrite(TheFile, FileName);
+      res := IOResult;
+   end;
+   {$I+ }
+   EndIO;
+   OpenOutFile := not IOFail('opening', res, false);
+end;
+
+{---------------------------- GetHeader ----------------------------}
+{ The .TEXT header lives in the middle of the first (header) page }
+procedure GetHeader(var Hdr: Header);
+var
+   DocHdr: ^Header;
+   i: integer;
+begin
+   DocHdr := Pointer(Ord(@The.Headlist^.P) + 512);
+   if (DocHdr^.Version >= HeaderVersion) and (DocHdr^.Version <= EditorVersion) then begin
+      Hdr := DocHdr^;
+      if (Hdr.Version < MarkerVersion) or (Hdr.NumMarkers < 0) or
+         (Hdr.NumMarkers > MarkerMax) then Hdr.NumMarkers := 0;
+   end
+   else
+      with Hdr do begin { build a default header }
+         Version := EditorVersion;
+         FontId.Fam := FamilyOf(MainFStyle, MainFSize);
+         FontId.SetEFace := [];
+         FontId.Dev := DevScreen;
+         FontName := '';
+         TabsIncr := 8;
+         LMargin := 0;
+         RMargin := 0;
+         ParaMargin := 0;
+         CmdChar := '^';
+         DocPosn := 0;
+         ElevPosn := 0;
+         Select.Left.Ln := 0;
+         Select.Left.Ch := 1;
+         Select.Right := Select.Left;
+         Dirty := false;
+         TimeWritten := 0;
+         NumMarkers := 0;
+         for i := 1 to MarkerMax do Markers[i].name := '';
+      end;
+   if (Hdr.TabsIncr <= 0) or (Hdr.TabsIncr > 30) then Hdr.TabsIncr := 8;
+end;
+
+procedure PutHeader(var Hdr: Header);
+var
+   DocHdr: ^Header;
+begin
+   DocHdr := Pointer(Ord(@The.Headlist^.P) + 512);
+   DocHdr^ := Hdr;
+end;
+
+{---------------------------- WriteFile ----------------------------}
+{ Write the document as a Workshop .TEXT file (header page, then 1K   }
+{ pages of lines; leading blanks compressed as DLE + count).          }
+function WriteFile(var editfile: phyle; FileName: FileStr): Boolean;
+var
+   pp: pageptr;
+   ppIndx, ppBeg, ppText, ppEnd, I: integer;
+   TextSize: integer;
+   rdbuf: array [1..IOpages] of pagebuf;
+   blksused: integer;
+   CurrPage: integer;
+   CurrPtr: ^pagebuf;
+   LineBeg, LineEnd: integer;
+   Hdr: Header;
+
+   procedure PutPageBuf(LastTime: Boolean);
+   var
+      Written, res: integer;
+   begin
+      if LastTime or (blksused = (IOpages * pageblks)) then begin
+         BeginIO;
+         Written := blockwrite(editfile, rdbuf, blksused);
+         res := IOResult;
+         EndIO;
+         if IOFail('writing', res, Written <> blksused) then Exit(WriteFile);
+         AppendBox('.');
+         CurrPage := 0;
+         blksused := 0;
+      end;
+      CurrPage := CurrPage + 1;
+      CurrPtr := @rdbuf[CurrPage];
+      blksused := blksused + pageblks;
+   end;
+
+   procedure PutLine(LineIndent, LineLength: integer; LastLine: Boolean);
+   var
+      Size: integer;
+   begin
+      Size := LineLength + CMin(LineIndent, 2);
+      if LastLine or (LineEnd + Size >= pagemax) then begin
+         while LineEnd <= pagemax do begin
+            CurrPtr^[LineEnd] := Nul;
+            LineEnd := LineEnd + 1;
+         end;
+         PutPageBuf(LastLine);
+         LineEnd := PageMin;
+      end;
+      LineBeg := LineEnd;
+      LineEnd := LineBeg + Size;
+      if LineIndent >= 2 then begin
+         CurrPtr^[LineBeg] := DLE;
+         CurrPtr^[LineBeg + 1] := Chr(LineIndent + 32);
+         LineBeg := LineBeg + 2;
+      end
+      else if LineIndent = 1 then begin
+         CurrPtr^[LineBeg] := ' ';
+         LineBeg := LineBeg + 1;
+      end;
+   end;
+
+begin { WriteFile }
+   DrawTheBox(ConCat('Saving to ', FileName));
+   WriteFile := false;
+   CurrPage := 0;
+   blksused := 0;
+   GetHeader(Hdr); { keep anything else stored there }
+   with Hdr do begin
+      Version := EditorVersion;
+      FontId := The.FontId;
+      TabsIncr := The.TabsIncr;
+      DocPosn := The.DocPosn;
+      ElevPosn := The.ElevPosn;
+      Select := The.Select;
+      Dirty := True;
+      NumMarkers := The.NumMarkers;
+      for I := 1 to MarkerMax do
+         if I <= The.NumMarkers then Markers[I] := The.Markers[I]
+         else Markers[I].name := '';
+   end;
+   PutHeader(Hdr);
+   pp := The.Headlist;
+   PutPageBuf(false); { header page }
+   CurrPtr^ := pp^.P;
+   LineEnd := pagemax;
+   pp := pp^.nxtpage;
+   while pp <> nil do begin
+      ppIndx := PageMin;
+      with pp^ do
+         while (ppIndx < pagemax) and (P[ppIndx] <> Nul) do begin
+            ppBeg := ppIndx;
+            while P[ppIndx] = ' ' do ppIndx := ppIndx + 1;
+            ppText := ppIndx;
+            while (P[ppIndx] <> CR) and (P[ppIndx] <> Nul) do ppIndx := ppIndx + 1;
+            ppEnd := ppIndx;
+            if P[ppIndx] = CR then ppIndx := ppIndx + 1; { bump past CR }
+            TextSize := ppEnd - ppText;
+            if TextSize = 0 then PutLine(0, 1, false) { empty line: room for CR }
+            else begin
+               while P[ppEnd - 1] = ' ' do ppEnd := ppEnd - 1; { trailing blanks }
+               TextSize := ppEnd - ppText;
+               PutLine(ppText - ppBeg, TextSize + 1, false);
+               for I := 0 to TextSize - 1 do
+                  CurrPtr^[LineBeg + I] := P[ppText + I];
+            end;
+            CurrPtr^[LineBeg + TextSize] := CR;
+         end;
+      pp := pp^.nxtpage;
+   end;
+   PutLine(0, 0, True); { output the last page }
+   HideTheBox;
+   WriteFile := True;
+end; { WriteFile }
+
+{ Append one line (ending with CR) to the page chain (shared by       }
+{ ReadFile and LoadWork).                                           }
+function AppendLn(var pp: PagePtr; var ppIndx: integer; var TheLine: str): Boolean;
+var
+   I: integer;
+   SrcPtr, DestPtr: ^PageBuf;
+begin
+   AppendLn := false;
+   if Length(TheLine) > (PageMax - ppIndx) then begin
+      for I := ppIndx to PageMax do pp^.p[I] := nul;
+      if not NewPage(pp^.nxtpage) then exit(AppendLn);
+      with pp^.nxtpage^ do begin
+         nxtpage := nil;
+         prvpage := pp;
+         LinesInP := 0;
+      end;
+      pp := pp^.nxtpage;
+      ppIndx := 0;
+   end;
+   SrcPtr := Pointer(Ord(@TheLine) + 1);
+   DestPtr := Pointer(Ord(@pp^.p) + ppIndx);
+   MoveLeft(SrcPtr^, DestPtr^, Length(TheLine));
+   ppIndx := ppIndx + Length(TheLine);
+   pp^.LinesInP := pp^.LinesInP + 1;
+   AppendLn := true;
+end;
+
+{ Finish a chain built with AppendLn: clear the rest of the last page or }
+{ create one empty text page.                                          }
+function EndChain(Contents, pp: PagePtr; ppIndx: integer): Boolean;
+var
+   I: integer;
+begin
+   EndChain := false;
+   if Contents^.nxtpage = nil then begin
+      if not NewClearPage(Contents^.nxtpage) then exit(EndChain);
+      with Contents^.nxtpage^ do begin
+         nxtpage := nil;
+         prvpage := Contents;
+         LinesInP := 0;
+      end;
+   end
+   else
+      for I := ppIndx to PageMax do pp^.p[I] := nul;
+   EndChain := true;
+end;
+
+{---------------------------- ReadFile ----------------------------}
+function ReadFile(var editfile: phyle; FileName: FileStr; var Contents: PagePtr): Boolean;
+var
+   NumFailures: Integer;
+   pp: pageptr;
+   ppindx: Integer;
+   rdbuf: array [1..IOpages] of pagebuf;
+   blksavail, CurrPage: integer;
+   CurrPtr: ^PageBuf;
+   TheLine: Str;
+   LineBeg: Integer;
+
+   procedure CloseIt;
+   begin
+      BeginIO;
+      close(EditFile);
+      EndIO;
+   end;
+
+   procedure abortRead(Message: Str);
+   begin
+      CloseIt;
+      FreeUp(Contents);
+      if Length(Message) > 0 then
+         Error(ConCat('Can''t read file because ', Message));
+      HideTheBox;
+      ReadFile := False;
+      Exit(ReadFile);
+   end;
+
+   function GetPageBuf: Boolean;
+   var res: integer;
+   begin
+      if blksavail = 0 then begin
+         CurrPage := 0;
+         AppendBox('.');
+         BeginIO;
+         {$I- }
+         blksavail := blockread(editfile, rdbuf, IOpages * pageblks);
+         {$I+ }
+         res := IOResult;
+         EndIO;
+         if res = 625 then begin
+            if NumFailures = 0 then warning('File may have been scavenged');
+            NumFailures := NumFailures + 1;
+         end
+         else if IOFail('reading', res, False) then abortRead('');
+      end;
+      if blksavail >= 2 then begin
+         CurrPage := CurrPage + 1;
+         CurrPtr := @rdbuf[CurrPage];
+         blksavail := blksavail - pageblks;
+         if CurrPtr^[pagemax] <> nul then begin
+            if NumFailures = 0 then Warning('WARNING: File may be in bad format');
+            NumFailures := NumFailures + 1;
+         end;
+         GetPageBuf := True;
+      end
+      else begin
+         if blksavail = 1 then begin
+            if NumFailures = 0 then Warning('WARNING: File has odd number of blocks');
+            NumFailures := NumFailures + 1;
+         end;
+         GetPageBuf := False;
+      end;
+      LineBeg := 0;
+   end;
+
+   function GetLine: Boolean;
+   var
+      Ch: Char;
+      I, LineLength: Integer;
+      GetState: (Getting, GetDLE, GetDone);
+   begin
+      if LineBeg > PageMax then begin
+         GetLine := False;
+         Exit(GetLine);
+      end;
+      LineLength := 0;
+      GetState := Getting;
+      while (LineBeg <= pagemax) and (GetState <> GetDone) do begin
+         Ch := CurrPtr^[LineBeg];
+         if GetState = GetDLE then begin { expand the blanks }
+            for I := 1 to (Ord(Ch) - 32) do
+               if LineLength < maxwidth - 1 then begin
+                  LineLength := LineLength + 1;
+                  TheLine[LineLength] := ' ';
+               end;
+            GetState := Getting;
+         end
+         else if Ch = DLE then GetState := GetDLE
+         else if Ch <> Nul then begin
+            if Ch = CR then begin
+               LineLength := LineLength + 1;
+               TheLine[LineLength] := Ch;
+               GetState := GetDone;
+            end
+            else if LineLength < maxwidth - 1 then begin
+               LineLength := LineLength + 1;
+               TheLine[LineLength] := Ch;
+            end
+            else begin
+               if NumFailures = 0 then warning('Line exceeds 255 characters.  Truncating line.');
+               NumFailures := NumFailures + 1;
+            end;
+         end;
+         LineBeg := LineBeg + 1;
+      end;
+      if LineLength > 0 then
+         if TheLine[LineLength] <> CR then begin
+            LineLength := LineLength + 1;
+            TheLine[LineLength] := CR;
+         end;
+      TheLine[0] := Chr(LineLength);
+      GetLine := (LineLength > 0);
+   end;
+
+begin { ReadFile }
+   Contents := nil;
+   DrawTheBox(concat('Reading from ', filename));
+   blksavail := 0;
+   NumFailures := 0;
+   if not NewPage(Contents) then abortRead(OutOfMem);
+   if not GetPageBuf then abortRead('the file is empty');
+   with Contents^ do begin
+      nxtpage := nil;
+      prvpage := nil;
+      P := CurrPtr^; { the header page }
+   end;
+   pp := Contents;
+   ppIndx := pageMax + 1; { so the header page is skipped }
+
+   while GetPageBuf do
+      while GetLine do
+         if not AppendLn(pp, ppIndx, TheLine) then abortRead(OutOfMem);
+   if not EndChain(Contents, pp, ppIndx) then abortRead(OutOfMem);
+   HideTheBox;
+   CloseIt;
+   ReadFile := True;
+end; { ReadFile }
+
+
+{==============================================================================}
+{  The document as a whole                                                   }
+{==============================================================================}
+
+{ A fresh header page (all nul -> GetHeader builds defaults) + empty text }
+function EmptyChain(var Contents: PagePtr): Boolean;
+begin
+   EmptyChain := false;
+   if not NewClearPage(Contents) then exit(EmptyChain);
+   if not NewClearPage(Contents^.nxtpage) then begin
+      FreeUp(Contents);
+      exit(EmptyChain);
+   end;
+   Contents^.nxtpage^.prvpage := Contents;
+   EmptyChain := true;
+end;
+
+{ Redisplay everything (window + scroll bars) }
+procedure ShowAll;
+begin
+   if myWindow = nil then exit(ShowAll);
+   Install(myWindow);
+   ShowTitle;
+   CaretVis(false);
+   ClipRect(theFolder^.PortRect);
+   EraseRect(theFolder^.PortRect);
+   UseDocFont;
+   Recompute;
+   if IsActive then DrawFolder else UnDrawFolder;
+   ClipToText;
+   PaintDoc(CMin(CMax(The.DocPosn, 0), MaxPosn));
+   PaintElev(CalcElevPosn(The.DocPosn));
+end;
+
+{ Replace the document's text by Contents (whose first page is a .TEXT }
+{ header page).                                                        }
+procedure InstallText(Contents: pageptr; KeepPlace: boolean);
+var
+   Hdr: Header;
+   i: integer;
+begin
+   CaretVis(false);
+   if The.HeadList <> nil then FreeUp(The.HeadList);
+   The.Headlist := Contents;
+   CacheLn := - 1;
+   GetHeader(Hdr);
+   The.TabsIncr := Hdr.TabsIncr;
+   StyleOf(Hdr.FontId.Fam, The.FontStyle, The.FontSize);
+   FixDocEnd;
+   The.NumMarkers := Hdr.NumMarkers;   { the markers saved in the file }
+   for i := 1 to The.NumMarkers do The.Markers[i] := Hdr.Markers[i];
+   ValidMarks;
+   if not KeepPlace then begin
+      { Where the text was when it was saved: the header's scroll position }
+      { and selection, as WriteFile stored them.  Checked against the text }
+      { that was actually loaded; anything odd falls back to the top.     }
+      The.Select := Hdr.Select;
+      The.DocPosn := Hdr.DocPosn;
+      with The.Select do begin
+         if (Left.Ln < 0) or (Left.Ln > The.LinesTot) or (Left.Ch < 1) or
+            (Right.Ln < 0) or (Right.Ln > The.LinesTot) or (Right.Ch < 1) or
+            (Right.LnCh < Left.LnCh) then begin
+            Left.Ln := 0;
+            Left.Ch := 1;
+            Right := Left;
+         end;
+         { not beyond the end of their lines }
+         Left.Ch := CMin(Left.Ch, LnLength(Left.Ln) + 1);
+         Right.Ch := CMin(Right.Ch, LnLength(Right.Ln) + 1);
+      end;
+      if (The.DocPosn < 0) or (The.DocPosn > The.LinesTot) then The.DocPosn := 0;
+   end;
+   Last.Cmd := CmdNone;
+   Last.Undoable := false;
+   if Last.Data in [CmdCut, CmdCopy, CmdPaste, CmdType] then FreeUp(Last.List);
+   Last.Data := CmdNone;
+   ShowAll;
+   RefreshMenuState;
+end;
+
+{ OK to throw away the current text? }
+function DiscardOK(Why: str255): Boolean;
+begin
+   DiscardOK := true;
+   if The.Changed then
+      DiscardOK := Confirm(ConCat('The text has unsaved changes.  ', Why, ' anyway'));
+end;
+
+procedure DoNewText;
+var
+   Contents: PagePtr;
+begin
+   StartCmd(CmdFile, false);
+   if not DiscardOK('Start a new text') then exit(DoNewText);
+   if not EmptyChain(Contents) then begin
+      Error(OutOfMem);
+      exit(DoNewText);
+   end;
+   The.HasFile := false;
+   The.FileName := '';
+   InstallText(Contents, false);
+   The.Changed := false;
+end;
+
+procedure DoOpenText;
+var
+   FName: FileStr;
+   Contents: pageptr;
+   editfile: phyle;
+begin
+   StartCmd(CmdFile, false);
+   if not DiscardOK('Open another file') then exit(DoOpenText);
+   repeat
+      if not InFileName('Open text file named ? ', FName) then begin
+         HideTheBox;
+         exit(DoOpenText);
+      end;
+   until OpenInFile(FName, editfile);
+   if ReadFile(editfile, FName, Contents) then begin
+      The.FileName := FName;
+      The.HasFile := true;
+      InstallText(Contents, false);
+      The.Changed := false;
+   end;
+   HideTheBox;
+end;
+
+{ Save to the current file, or ask for a name (AskName) }
+function DoSaveText(AskName: boolean): Boolean;
+label 100;
+var
+   FName: FileStr;
+   editfile: phyle;
+   res: integer;
+begin
+   StartCmd(CmdFile, false);
+   DoSaveText := false;
+   if AskName or not The.HasFile then begin
+      if not OutFileName('Save text file as ? ', FName) then goto 100;
+   end
+   else FName := The.FileName;
+   if OpenOutFile(FName, editfile) then
+      if WriteFile(editfile, FName) then begin
+         BeginIO;
+         Close(editfile, CRUNCH);
+         res := IOResult;
+         EndIO;
+         if not IOFail('closing', res, false) then begin
+            The.FileName := FName;
+            The.HasFile := true;
+            The.Changed := false;
+            DoSaveText := true;
+            ShowTitle;
+         end;
+      end
+      else begin
+         BeginIO;
+         Close(editfile, PURGE);
+         EndIO;
+      end;
+100:
+   HideTheBox;
+end;
+
+procedure DoRevert;
+var
+   editfile: phyle;
+   Contents: pageptr;
+begin
+   StartCmd(CmdFile, false);
+   if not The.HasFile then exit(DoRevert);
+   if not Confirm(ConCat('Revert to the saved version of "', The.FileName, '"')) then begin
+      HideTheBox;
+      exit(DoRevert);
+   end;
+   if OpenInFile(The.FileName, editfile) then
+      if ReadFile(editfile, The.FileName, Contents) then begin
+         InstallText(Contents, false);
+         The.Changed := false;
+      end;
+   HideTheBox;
+end;
+
+
+{==============================================================================}
+{  The saved-text data segment: the text survives Set Aside / Put Away       }
+{==============================================================================}
+
+{ Save the text, selection and settings.  Quiet: no messages (used at  }
+{ fcTerminate time, when no dialog may be shown).                     }
+procedure SaveWork(Quiet: boolean);
+var
+   hdr: WorkHdrPtr;
+   total, size, addr, dst: LongInt;
+   ref, err, junk, n: integer;
+   pp: PagePtr;
+   dp: PageBufPtr;
+begin
+   if The.HeadList = nil then exit(SaveWork);
+   total := 0;
+   pp := The.HeadList^.nxtpage;
+   while pp <> nil do begin
+      n := PageUsed(pp);
+      total := total + n;
+      if (pp^.nxtpage <> nil) and (n > 0) then
+         if pp^.p[n - 1] <> cr then total := total + 1;
+      pp := pp^.nxtpage;
+   end;
+   size := SizeOf(WorkHdr) + total;
+
+   BeginIO;
+   Kill_Object(junk, workPath);
+   Make_DataSeg(err, workPath, size, size, ref, addr, workLDSN, ds_shared);
+   EndIO;
+   if err > 0 then begin
+      if not Quiet then Error('There is not enough room on the disk to keep the text');
+      exit(SaveWork);
+   end;
+
+   hdr := Pointer(addr);
+   hdr^.Version := WorkVersion;
+   hdr^.HasFile := The.HasFile;
+   hdr^.Changed := The.Changed;
+   if length(The.FileName) <= 100 then hdr^.FileName := The.FileName
+   else begin
+      hdr^.FileName := '';
+      hdr^.HasFile := false;
+   end;
+   hdr^.Select := The.Select;
+   hdr^.DocPosn := The.DocPosn;
+   hdr^.TabsIncr := The.TabsIncr;
+   hdr^.FontStyle := The.FontStyle;
+   hdr^.FontSize := The.FontSize;
+   hdr^.NumMarkers := The.NumMarkers;
+   for n := 1 to The.NumMarkers do hdr^.Markers[n] := The.Markers[n];
+   hdr^.TextLen := total;
+
+   dst := addr + SizeOf(WorkHdr);
+   pp := The.HeadList^.nxtpage;
+   while pp <> nil do begin
+      n := PageUsed(pp);
+      dp := Pointer(dst);
+      if n > 0 then moveleft(pp^.p, dp^, n);
+      dst := dst + n;
+      if (pp^.nxtpage <> nil) and (n > 0) then
+         if pp^.p[n - 1] <> cr then begin
+            dp := Pointer(dst);
+            dp^[0] := cr;
+            dst := dst + 1;
+         end;
+      pp := pp^.nxtpage;
+   end;
+
+   BeginIO;
+   Close_DataSeg(err, ref);
+   EndIO;
+end; { SaveWork }
+
+{ Forget the saved text: the next launch starts with a fresh text }
+procedure KillWork;
+var
+   junk: integer;
+begin
+   BeginIO;
+   Kill_Object(junk, workPath);
+   EndIO;
+end;
+
+{ Reload the text saved by SaveWork; false if there is none (or it is bad) }
+function LoadWork: Boolean;
+label 90;
+var
+   hdr: WorkHdrPtr;
+   addr, base, len, rdPos: LongInt;
+   ref, err, junk, lineLen, ppIndx: integer;
+   Contents, pp: PagePtr;
+   cp: CharPtr;
+   ch: char;
+   TheLine: str;
+   done, ok: boolean;
+begin
+   LoadWork := false;
+   ok := false;
+   Contents := nil;
+   BeginIO;
+   Open_DataSeg(err, workPath, ref, addr, workLDSN);
+   EndIO;
+   if err > 0 then exit(LoadWork); { none: first launch }
+
+   hdr := Pointer(addr);
+   if hdr^.Version <> WorkVersion then goto 90;
+   len := hdr^.TextLen;
+   if (len < 0) or (len > 4000000) then goto 90;
+
+   if not NewClearPage(Contents) then goto 90; { header page }
+   pp := Contents;
+   ppIndx := pagemax + 1;
+   base := addr + SizeOf(WorkHdr);
+   rdPos := 0;
+   while rdPos < len do begin
+      lineLen := 0;
+      done := false;
+      while (not done) and (rdPos < len) do begin
+         cp := Pointer(base + rdPos);
+         ch := cp^;
+         rdPos := rdPos + 1;
+         if ch <> nul then begin
+            lineLen := lineLen + 1;
+            TheLine[lineLen] := ch;
+            if ch = cr then done := true
+            else if lineLen >= maxwidth - 1 then done := true; { split }
+         end;
+      end;
+      if lineLen > 0 then begin
+         if TheLine[lineLen] <> cr then begin
+            lineLen := lineLen + 1;
+            TheLine[lineLen] := cr;
+         end;
+         TheLine[0] := chr(lineLen);
+         if not AppendLn(pp, ppIndx, TheLine) then goto 90;
+      end;
+   end;
+   if not EndChain(Contents, pp, ppIndx) then goto 90;
+
+   { install it }
+   if The.HeadList <> nil then FreeUp(The.HeadList);
+   The.HeadList := Contents;
+   Contents := nil;
+   CacheLn := - 1;
+   TotalKnt;
+   The.HasFile := hdr^.HasFile;
+   The.FileName := hdr^.FileName;
+   The.Changed := hdr^.Changed;
+   The.TabsIncr := hdr^.TabsIncr;
+   if (The.TabsIncr <= 0) or (The.TabsIncr > 30) then The.TabsIncr := 8;
+   The.FontStyle := hdr^.FontStyle;
+   The.FontSize := hdr^.FontSize;
+   if not (The.FontStyle in [FModern, FClassic]) or
+      not (The.FontSize in [F8Pt20Pitch..F18PtPS]) then begin
+      The.FontStyle := MainFStyle;
+      The.FontSize := MainFSize;
+   end;
+   The.Select := hdr^.Select;
+   with The.Select do
+      if (Left.Ln < 0) or (Left.Ln > The.LinesTot) or (Left.Ch < 1) or (Left.Ch > maxwidth) or
+         (Right.Ln < 0) or (Right.Ln > The.LinesTot) or (Right.Ch < 1) or (Right.Ch > maxwidth) or
+         (Right.LnCh < Left.LnCh) then begin
+         Left.Ln := 0;
+         Left.Ch := 1;
+         Right := Left;
+      end;
+   The.DocPosn := hdr^.DocPosn;
+   if (The.DocPosn < 0) or (The.DocPosn > The.LinesTot) then The.DocPosn := 0;
+   The.NumMarkers := hdr^.NumMarkers;
+   if (The.NumMarkers < 0) or (The.NumMarkers > MarkerMax) then The.NumMarkers := 0;
+   for lineLen := 1 to The.NumMarkers do The.Markers[lineLen] := hdr^.Markers[lineLen];
+   ValidMarks;
+   ok := true;
+   LoadWork := true;
+90:
+   if not ok then FreeUp(Contents);
+   BeginIO;
+   Close_DataSeg(junk, ref);
+   EndIO;
+end; { LoadWork }
+
+{$S }
+
+
+{==============================================================================}
+{  Commands (Do.../Undo... procedures)                                        }
+{==============================================================================}
+
+{$S LTECmd }
+
+{---------------------------- DoGrow ----------------------------}
+procedure DoGrow(StartPt: Point);
+var
+   NewBR: Point;
+begin
+   CaretVis(false);
+   ClipRect(theFolder^.PortRect);
+   DragFrame(StartPt, true, NewBR);
+   SubPt(theFolder^.PortRect.topleft, NewBR); { to width & height }
+   FolderSize(theFolder, NewBR.h, NewBR.v, false);
+   SetPort(theFolder);
+   ClipRect(theFolder^.PortRect);
+   EraseRect(theFolder^.PortRect);
+   ValidRect(theFolder^.PortRect);
+   Recompute;
+   DrawFolder;
+   ClipToText;
+   PaintDoc(CMin(The.DocPosn, MaxPosn));
+   PaintElev(CalcElevPosn(The.DocPosn));
+end;
+
+{---------------------------- DoScroll ----------------------------}
+procedure DoScroll(StartPt: Point; HitSB: THSB; HitIcon: TIcon);
+var
+   ThumbPos: integer;
+begin
+   BeginUpdate(theFolder); { make the screen valid before scrolling }
+   if not EmptyRgn(theFolder^.VisRgn) then begin
+      DrawFolder;
+      PaintDoc(The.DocPosn);
+   end;
+   EndUpdate(theFolder);
+   if HitSB = RightSBox then
+      case HitIcon of
+         IconArwA, IconArwB: begin
+            ClipRect(theFolder^.PortRect);
+            PaintArw(HitSB, HitIcon, true);
+            ClipToText;
+            repeat
+               if HitIcon = IconArwA then Display(The.DocPosn - 1)
+               else Display(The.DocPosn + 1);
+            until not StillDown;
+            ClipRect(theFolder^.PortRect);
+            PaintArw(HitSB, HitIcon, false);
+            ClipToText;
+         end;
+         IconThumb: begin
+            ClipRect(theFolder^.PortRect);
+            DragThumb(HitSB, StartPt, ThumbPos);
+            ClipToText;
+            UpdateElev(ThumbPos);
+            UpdateDoc(CalcDocPosn(ThumbPos));
+         end;
+         IconPagA, IconPagB: begin
+            ClipRect(theFolder^.PortRect);
+            PaintArw(HitSB, HitIcon, true);
+            ClipToText;
+            repeat
+               if HitIcon = IconPagA then Display(The.DocPosn - (The.LinesVis - 1))
+               else Display(The.DocPosn + (The.LinesVis - 1));
+            until not StillDown;
+            ClipRect(theFolder^.PortRect);
+            PaintArw(HitSB, HitIcon, false);
+            ClipToText;
+         end;
+         otherwise ;
+      end;
+end;
+
+procedure DoCut;
+begin
+   StartCmd(CmdCut, true);
+   MakeVisible;
+   Last.List := scraplist;
+   scraplist := nil;
+   InvSelection(The.Select.Left, The.Select.Right);
+   Cut(scraplist);
+   MakeVisible;
+end;
+
+procedure UndoCut;
+begin
+   StartCmd(CmdUndo, true);
+   MakeVisible;
+   CaretVis(false);
+   Paste(scraplist); { replace old selection }
+   The.Select := Last.Select;
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   FreeUp(scraplist); { restore old clipboard contents }
+   scraplist := Last.List;
+   Last.List := nil;
+   MakeVisible;
+end;
+
+procedure DoCopy;
+begin
+   StartCmd(CmdCopy, true);
+   MakeVisible;
+   Last.List := scraplist;
+   scraplist := nil;
+   Copie(scraplist);
+end;
+
+procedure UndoCopy;
+begin
+   StartCmd(CmdUndo, true);
+   MakeVisible;
+   FreeUp(scraplist);
+   scraplist := Last.List;
+   Last.List := nil;
+end;
+
+procedure DoPaste;
+begin
+   StartCmd(CmdPaste, true);
+   MakeVisible;
+   if IsSelection then begin { first remove the selected text }
+      InvSelection(The.Select.Left, The.Select.Right);
+      Cut(Last.List);
+   end;
+   if IsInsertion then CaretVis(false);
+   Paste(scraplist);
+   MakeVisible;
+end;
+
+procedure UndoPaste;
+var
+   Dummy: PagePtr;
+begin
+   StartCmd(CmdUndo, true);
+   MakeVisible;
+   CaretVis(false);
+   The.Select.Left := Last.Select.Left; { remove what was pasted }
+   Dummy := nil;
+   Cut(Dummy);
+   FreeUp(Dummy);
+   if Last.Select.Left.LnCh <> Last.Select.Right.LnCh then Paste(Last.List);
+   The.Select.Left := Last.Select.Left;
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   FreeUp(Last.List);
+   MakeVisible;
+end;
+
+procedure DoLeft;
+var
+   Line: str;
+begin
+   StartCmd(CmdAdjLeft, false);
+   GenLine(Line, The.Select.Left.Ln);
+   if The.Select.Left.Ch > Length(Line) then Exit(DoLeft);
+   if Line[The.Select.Left.Ch] <> ' ' then Exit(DoLeft);
+   Last.Undoable := true;
+   MakeVisible;
+   AdjustLeft;
+   MakeVisible;
+end;
+
+procedure UndoLeft;
+begin
+   StartCmd(CmdUndo, true);
+   MakeVisible;
+   AdjustRight;
+   MakeVisible;
+end;
+
+procedure DoRight;
+begin
+   StartCmd(CmdAdjRight, true);
+   MakeVisible;
+   AdjustRight;
+   MakeVisible;
+end;
+
+procedure UndoRight;
+begin
+   StartCmd(CmdUndo, true);
+   MakeVisible;
+   AdjustLeft;
+   MakeVisible;
+end;
+
+procedure DoTabs(Doing: Boolean);
+var
+   Value: integer;
+   GotValue: Boolean;
+   S: str;
+begin
+   if Doing then begin
+      NumToStr(The.TabsIncr, S);
+      DrawTheBox(concat('Set tabs every how many spaces ? [', S, '] '));
+      GotValue := GetNumber(Value, false);
+      HideTheBox;
+      if (not GotValue) or (Value <= 0) or (Value > 30) then begin
+         StartCmd(CmdTabs, false);
+         Exit(DoTabs);
+      end;
+   end
+   else Value := Last.TabsIncr;
+   StartCmd(CmdTabs, true);
+   Last.TabsIncr := The.TabsIncr;
+   The.TabsIncr := Value;
+   The.Changed := true;
+end;
+
+procedure UndoTabs;
+var
+   Value: integer;
+begin
+   StartCmd(CmdUndo, true);
+   Value := Last.TabsIncr;
+   Last.TabsIncr := The.TabsIncr;
+   The.TabsIncr := Value;
+end;
+
+procedure DoSelAll;
+begin
+   StartCmd(CmdSelAll, true);
+   SelectAll;
+   MakeVisible;
+end;
+
+procedure UndoSelAll;
+begin
+   StartCmd(CmdUndo, true);
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   if IsInsertion then CaretVis(false);
+   The.Select := Last.Select;
+   if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   MakeVisible;
+end;
+
+procedure DoFStyle(WhichItem: integer);
+begin
+   StartCmd(CmdFStyle, true);
+   Last.FontStyle := The.FontStyle;
+   ChangeFont(WhichItem, The.FontSize);
+end;
+
+procedure UndoFStyle;
+var
+   WhichItem: integer;
+begin
+   StartCmd(CmdUndo, true);
+   WhichItem := Last.FontStyle;
+   Last.FontStyle := The.FontStyle;
+   ChangeFont(WhichItem, The.FontSize);
+end;
+
+procedure DoFSize(WhichItem: integer);
+begin
+   StartCmd(CmdFSize, true);
+   Last.FontSize := The.FontSize;
+   ChangeFont(The.FontStyle, WhichItem);
+end;
+
+procedure UndoFSize;
+var
+   WhichItem: integer;
+begin
+   StartCmd(CmdUndo, true);
+   WhichItem := Last.FontSize;       { the size, not the style }
+   Last.FontSize := The.FontSize;
+   ChangeFont(The.FontStyle, WhichItem);
+end;
+
+{ characters that may be typed into the text }
+function Typeable(Ch: char): boolean;
+begin
+   Typeable := (Ch >= ' ') or (Ch = bs) or (Ch = cr) or (Ch = tab) or (Ch = EnterCh);
+end;
+
+{---------------------------- DoTypeIn ----------------------------}
+procedure DoTypeIn(TheCh: Char);
+var
+   InsertCount: integer;
+   InsertBuf: pagebuf;
+   DeleteCount: integer;
+   Typed: PagePtr;
+
+   { take further keystrokes that are already waiting }
+   function MoreTypeIn: Boolean;
+   var
+      e: EventRecord;
+   begin
+      MoreTypeIn := false;
+      if InsertCount < 100 then
+         if PeekEvent(e) then
+            if e.What = KeyDown then
+               if not (e.AppleKey or (e.Ascii in CmdChrs)) and Typeable(e.Ascii) then begin
+                  GetEvent(e);
+                  TheCh := e.Ascii;
+                  MoreTypeIn := true;
+               end;
+   end;
+
+begin { DoTypeIn }
+   if (Last.Cmd = CmdUndo) and (TheCh = nul) then begin { redo of typing }
+      Typed := Last.List;
+      Last.List := nil;
+   end
+   else Typed := nil;
+
+   if Last.Cmd = CmdType then
+      { successive typing is one Type command }
+   else begin
+      StartCmd(CmdType, true);
+      if IsSelection then begin
+         MakeVisible;
+         InvSelection(The.Select.Left, The.Select.Right);
+         Cut(Last.List);
+         if TheCh = bs then TheCh := nul; { backspace just removes the selection }
+      end;
+   end;
+
+   CaretVis(false);
+   if Typed <> nil then Paste(Typed);
+   FreeUp(Typed);
+
+   InsertCount := 0;
+   DeleteCount := 0;
+   repeat
+      if TheCh = bs then
+         if InsertCount > 0 then InsertCount := InsertCount - 1
+         else DeleteCount := DeleteCount + 1
+      else if TheCh <> nul then begin
+         InsertBuf[InsertCount] := TheCh;
+         InsertCount := InsertCount + 1;
+      end;
+   until not MoreTypeIn;
+
+   RemoveCursor;
+   if DeleteCount > 0 then Deletion(DeleteCount);
+   if InsertCount > 0 then Insertion(InsertBuf, InsertCount);
+   MakeVisible;
+end; { DoTypeIn }
+
+procedure UndoTypeIn;
+var
+   Typed: PagePtr;
+   Where: Place;
+begin
+   StartCmd(CmdUndo, true);
+   MakeVisible;
+   CaretVis(false);
+   Typed := nil;
+   if The.Select.Left.LnCh > Last.Select.Left.LnCh then begin { remove what was typed }
+      The.Select.Left := Last.Select.Left;
+      Cut(Typed);
+   end;
+   if Last.Select.Left.LnCh <> Last.Select.Right.LnCh then begin
+      Where := The.Select.Left;
+      Paste(Last.List); { replace old selection }
+      The.Select.Left := Where;
+      InvSelection(The.Select.Left, The.Select.Right);
+   end;
+   FreeUp(Last.List);
+   Last.List := Typed;
+   MakeVisible;
+end;
+
+{---------------------------- DoUndo ----------------------------}
+procedure DoUndo;
+begin
+   if not Last.Undoable then Exit(DoUndo);
+   case Last.Cmd of
+      CmdType:     UndoTypeIn;
+      CmdCut:      UndoCut;
+      CmdPaste:    UndoPaste;
+      CmdCopy:     UndoCopy;
+      CmdTabs:     UndoTabs;
+      CmdAdjLeft:  UndoLeft;
+      CmdAdjRight: UndoRight;
+      CmdSelAll:   UndoSelAll;
+      CmdFind, CmdFindSame: UndoFind;
+      CmdToken:    begin StartCmd(CmdUndo, true); TokenMode := not TokenMode;
+                         CheckItem(myMenus[mSearch], miWords, TokenMode) end;
+      CmdCase:     begin StartCmd(CmdUndo, true); MatchCase := not MatchCase;
+                         CheckItem(myMenus[mSearch], miCase, MatchCase) end;
+      CmdWrap:     begin StartCmd(CmdUndo, true); WrapSearch := not WrapSearch;
+                         CheckItem(myMenus[mSearch], miWrap, WrapSearch) end;
+      CmdGoTo:     UndoGoto;
+      CmdCurrent:  UndoShowCursor;
+      CmdFStyle:   UndoFStyle;
+      CmdFSize:    UndoFSize;
+      CmdUndo:     { Undo of Undo, i.e. Redo }
+         case Last.Data of
+            CmdType:     DoTypeIn(nul);
+            CmdCut:      DoCut;
+            CmdPaste:    DoPaste;
+            CmdCopy:     DoCopy;
+            CmdTabs:     DoTabs(false);
+            CmdAdjLeft:  DoLeft;
+            CmdAdjRight: DoRight;
+            CmdSelAll:   DoSelAll;
+            CmdFind, CmdFindSame: DoFind(false, Last.Data);
+            CmdToken:    DoToken;
+            CmdCase:     DoCase;
+            CmdWrap:     DoWrap;
+            CmdGoTo:     UndoGoto;
+            CmdCurrent:  DoShowCursor;
+            CmdFStyle:   DoFStyle(Last.FontStyle);
+            CmdFSize:    DoFSize(Last.FontSize);
+            otherwise ;
+         end;
+      otherwise ;
+   end;
+end;
+
+{---------------------------- DoCmdChr ----------------------------}
+{ The arrow keys move the insertion point (with Shift: extend the   }
+{ selection; with Apple: to the line end / document end).           }
+procedure DoCmdChr(e: EventRecord);
+var
+   CursorMark, StartPlace: Place;
+   DoSelect: boolean;
+
+   function MoreCmdChrs: Boolean;
+   begin
+      MoreCmdChrs := false;
+      if PeekEvent(e) then
+         if e.What = KeyDown then
+            if e.Ascii in CmdChrs then begin
+               GetEvent(e);
+               MoreCmdChrs := true;
+            end;
+   end;
+
+begin
+   if IsSelection then begin
+      InvSelection(The.Select.Left, The.Select.Right);
+      SetInsertion(The.Select.Left);
+   end;
+   if IsInsertion then begin
+      MakeVisible;
+      CursorMark := The.Select.Left;
+      StartPlace := CursorMark;
+      repeat
+         DoSelect := e.ShiftKey;
+         case e.Ascii of
+            LeftCh:
+               if e.AppleKey then CursorMark.Ch := 1
+               else if CursorMark.Ch > 1 then CursorMark.Ch := CursorMark.Ch - 1
+               else if CursorMark.Ln > 0 then begin { to the end of the previous line }
+                  CursorMark.Ln := CursorMark.Ln - 1;
+                  CursorMark.Ch := LnLength(CursorMark.Ln) + 1;
+               end;
+            RightCh:
+               if e.AppleKey then CursorMark.Ch := LnLength(CursorMark.Ln) + 1
+               else if CursorMark.Ch <= LnLength(CursorMark.Ln) then
+                  CursorMark.Ch := CursorMark.Ch + 1
+               else if CursorMark.Ln < The.LinesTot then begin { start of next line }
+                  CursorMark.Ln := CursorMark.Ln + 1;
+                  CursorMark.Ch := 1;
+               end;
+            UpCh:
+               if e.AppleKey then begin
+                  CursorMark.Ln := 0;
+                  CursorMark.Ch := 1;
+               end
+               else if CursorMark.Ln > 0 then CursorMark.Ln := CursorMark.Ln - 1;
+            DownCh:
+               if e.AppleKey then begin
+                  CursorMark.Ln := The.LinesTot;
+                  CursorMark.Ch := 1;
+               end
+               else if CursorMark.Ln < The.LinesTot then CursorMark.Ln := CursorMark.Ln + 1;
+         end;
+         { never beyond the end of the line }
+         CursorMark.Ch := CMin(CursorMark.Ch, LnLength(CursorMark.Ln) + 1);
+         if DoSelect then begin
+            if StartPlace.LnCh < CursorMark.LnCh then SetSelection(StartPlace, CursorMark)
+            else SetSelection(CursorMark, StartPlace);
+         end
+         else begin
+            SetInsertion(CursorMark);
+            StartPlace := CursorMark;
+         end;
+         if CursorMark.Ln < The.DocPosn then Display(CursorMark.Ln)
+         else if CursorMark.Ln >= The.DocPosn + The.LinesVis then
+            Display(CursorMark.Ln - The.LinesVis + 1)
+         else UpdateElev(CalcElevPosn(The.DocPosn));
+         CaretVis(true);
+      until not MoreCmdChrs;
+   end;
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  Printing: through the Office System Print Manager.  The text is drawn     }
+{  line by line with QuickDraw straight                                       }
+{  into the printer's port; the font comes out in the printer's own strike,   }
+{  so nothing needs scaling.                                                  }
+{==============================================================================}
+
+{$S LTEPrnt }
+
+{ The print record is defaulted lazily: PrPrfDefault talks to the print }
+{ system's background process, which is no thing to wait for at launch. }
+procedure EnsurePrRec;
+begin
+   if not FPrPrfValid(prRec) then PrPrfDefault(prRec);
+end;
+
+{ Print/Format for Printer ...: printer, paper size, orientation }
+procedure DoFormatPr;
+var
+   fNewStl: boolean;
+begin
+   EnsurePrRec;
+   PrPrfDlg(prRec, fNewStl, true);   { true: no special-paper-size fields }
+end;
+
+{ Print/Print ... (SelOnly = false) and Print Selection ... (true).     }
+{ Print Selection prints the lines the selection touches.              }
+procedure DoPrintText(SelOnly: boolean);
+var
+   fNewStl, done: boolean;
+   prPort: TPrPort;
+   savePort: GrafPtr;
+   fi: FontInfo;
+   area: Rect;
+   lineH, perPage, firstLn, lastLn, ln, l, k, pageNo, row, fam: integer;
+   Line, n, title: str;
+begin
+   if myWindow = nil then exit(DoPrintText);
+   firstLn := 0;
+   lastLn := The.LinesTot - 1;    { the text always ends with a CR }
+   if SelOnly then begin
+      if not IsSelection then exit(DoPrintText);
+      firstLn := The.Select.Left.Ln;
+      lastLn := The.Select.Right.Ln;
+      if (The.Select.Right.Ch = 1) and (lastLn > firstLn) then
+         lastLn := lastLn - 1;    { selection ends at the start of a line }
+   end;
+   if lastLn < firstLn then begin
+      Warning('There is nothing to print');
+      HideTheBox;
+      exit(DoPrintText);
+   end;
+
+   EnsurePrRec;
+   { the print dialog: copies and a page range (ePrNormal; the other   }
+   { choices, ePgRangeSuppress and ePrDialogSuppress, hide the range / }
+   { the whole dialog -- PrStdInfo's PrMenuSuppress).  Pages outside   }
+   { the range are skipped by the Print Manager: PrPageStart returns   }
+   { false for them and PrPageEnd true after the last one.             }
+   if not FPrInsDlg(prRec, fNewStl, ePrNormal) then exit(DoPrintText);
+
+   if The.HasFile then title := The.FileName
+   else title := 'New text file';
+   fam := FamilyOf(The.FontStyle, The.FontSize);
+   CaretVis(false);
+   GetPort(savePort);
+
+   if PrDocStart(prRec, prPort, printLDSN, true) then begin
+      { the page geometry, in printer dots }
+      SetPort(@prPort.gport);
+      TextFont(fam);
+      TextFace([]);
+      GetFontInfo(fi);           { the PRINTER's metrics for the font }
+      lineH := fi.ascent + fi.descent + fi.leading;
+      if lineH < 1 then lineH := 1;
+      area := prRec.PrInfo.rPrintable;
+      with prRec.PrInfo do        { half an inch of margin, if it fits }
+         if (area.right - area.left > 2 * HRes) and (area.bottom - area.top > 2 * VRes) then
+            InsetRect(area, HRes div 2, VRes div 2);
+      perPage := (area.bottom - area.top) div lineH - 2;  { 2: the footer }
+      if perPage < 1 then perPage := 1;
+
+      ln := firstLn;
+      pageNo := 0;
+      done := false;
+      repeat
+         pageNo := pageNo + 1;
+         if PrPageStart(prRec, prPort) then begin
+            SetPort(@prPort.gport);
+            TextFont(fam);
+            TextFace([]);
+            row := area.top + fi.ascent;
+            l := ln;
+            k := 0;
+            while (k < perPage) and (l <= lastLn) do begin
+               GenLine(Line, l);
+               if length(Line) > 0 then begin
+                  MoveTo(area.left, row);
+                  DrawText(@Line, 1, length(Line));
+               end;
+               row := row + lineH;
+               l := l + 1;
+               k := k + 1;
+            end;
+            { the footer: file name and page number }
+            NumToStr(pageNo, n);
+            MoveTo(area.left, area.bottom - fi.descent);
+            DrawString(concat(title, '      Page ', n));
+         end;
+         ln := ln + perPage;
+         if PrPageEnd(prRec, prPort) then done := true;  { the job is over }
+         if ln > lastLn then done := true;
+      until done;
+   end;
+   PrDocEnd(prRec, prPort);   { always: releases the spool, starts printing }
+
+   SetPort(savePort);
+   Install(myWindow);
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  Menus                                                                       }
+{==============================================================================}
+
+{$S LTEMenu }
+
+{ Check marks that tell the truth }
+procedure RefreshMenuState;
+var i: integer;
+begin
+   CheckItem(myMenus[mSearch], miWords, TokenMode);
+   CheckItem(myMenus[mSearch], miCase, MatchCase);
+   CheckItem(myMenus[mSearch], miWrap, WrapSearch);
+   CheckItem(myMenus[mEdit], miLineNums, ShowNums);
+   for i := FModern to F18PtPS do
+      if i <> 3 then CheckItem(myMenus[mStyle], i, false);
+   CheckItem(myMenus[mStyle], The.FontStyle, true);
+   CheckItem(myMenus[mStyle], The.FontSize, true);
+end;
+
+{ Every folderActivate rebuilds the menu bar (TakeControl cleared it) }
+procedure PutUpMenus;
+var m: integer;
+begin
+   ClearMenuBar;
+   for m := mFile to lastMenu do
+      InsertMenu(myMenus[m], 0);
+   RefreshMenuState;
+   DrawMenuBar;
+end;
+
+{ Enable/disable items just before a menu is pulled }
+procedure ReadyMenus;
+
+   procedure Able(m, item: integer; isOn: boolean);
+   begin
+      if isOn then EnableItem(myMenus[m], item)
+      else DisableItem(myMenus[m], item);
+   end;
+
+begin
+   if not IsActive then exit(ReadyMenus);
+   Install(myWindow);
+   Able(mEdit, miCut, IsSelection);
+   Able(mEdit, miCopy, IsSelection);
+   Able(mEdit, miShLeft, IsSelection);
+   Able(mEdit, miShRight, IsSelection);
+   Able(mEdit, miPaste, scraplist <> nil);
+   Able(mEdit, miUndo, Last.Undoable);
+   Able(mSearch, miFindSame, length(Target) > 0);
+   Able(mSearch, miFindAll, scraplist <> nil);
+   Able(mFile, miRevert, The.HasFile);
+   Able(mPrint, miPrSel, IsSelection);
+   Able(mMarkers, miDelMark, The.NumMarkers > 0);
+   Able(mMarkers, miGoMark, The.NumMarkers > 0);
+end;
+
+procedure PutAwayDoc; forward;
+
+procedure MenuCommand(TheMenu: integer; TheItem: integer);
+begin
+   if myWindow <> nil then Install(myWindow);
+   case TheMenu of
+      mFile:
+         case TheItem of
+            miAsdAll:   DoFilingCmd(cmdClosAll);  { the Filer does the filing; }
+            miAside:    DoFilingCmd(cmdClose);    { it comes back as fcClose   }
+            miPutAway:  PutAwayDoc;
+            miNewText:  DoNewText;
+            miOpenText: DoOpenText;
+            miSaveText: if DoSaveText(false) then ;
+            miSaveAs:   if DoSaveText(true) then ;
+            miRevert:   DoRevert;
+            miExit:     PutAwayDoc;   { a tool "exits" by putting its window }
+                                      { away; the Filer ends the process     }
+            otherwise ;
+         end;
+      mEdit:
+         if IsActive then
+            case TheItem of
+               miUndo:    DoUndo;
+               miCut:     if IsSelection then DoCut;
+               miCopy:    if IsSelection then DoCopy;
+               miPaste:   DoPaste;
+               miShLeft:  if IsSelection then DoLeft;
+               miShRight: if IsSelection then DoRight;
+               miTabs:    DoTabs(true);
+               miSelAll:  DoSelAll;
+               miLineNums: begin   { toggle the margin and redraw everything }
+                  ShowNums := not ShowNums;
+                  CheckItem(myMenus[mEdit], miLineNums, ShowNums);
+                  ShowAll;
+               end;
+               otherwise ;
+            end;
+      mSearch:
+         if IsActive then
+            case TheItem of
+               miFind:     DoFind(true, CmdFind);
+               miFindSame: DoFind(true, CmdFindSame);
+               miFindAll:  DoFindAll;
+               miGoTo:     DoGoTo;
+               miShowIns:  DoShowCursor;
+               miWords:    DoToken;
+               miCase:     DoCase;
+               miWrap:     DoWrap;
+               otherwise ;
+            end;
+      mStyle:
+         if IsActive then
+            case TheItem of
+               FModern, FClassic: DoFStyle(TheItem);
+               F8Pt20Pitch, F8Pt15Pitch, F10Pt12Pitch, F12Pt10Pitch, F12PtPS, F18PtPS:
+                  DoFSize(TheItem);
+               otherwise ;
+            end;
+      mPrint:
+         if IsActive then
+            case TheItem of
+               miFormat:  DoFormatPr;
+               miPrint:   DoPrintText(false);
+               miPrSel:   if IsSelection then DoPrintText(true);
+               miMonitor: PrBgdDlg;   { the print system's status dialog }
+               otherwise ;
+            end;
+      mMarkers:
+         if IsActive then
+            case TheItem of
+               miSetMark: SetMarker;
+               miDelMark: DeleteMarker;
+               miGoMark:  GoToMarker;
+               otherwise ;
+            end;
+      otherwise ;
+   end;
+   HiLiteMenu(0);
+end;
+
+{$S }
+
+
+{==============================================================================}
+{  The Office System lifecycle                                                 }
+{==============================================================================}
+
+{$S LTELife }
+
+{ Create the two scroll bars of the document, once }
+procedure MakeScrollBars;
+var
+   SBox: THSB;
+   DummyPt: Point;
+begin
+   if SBMade then exit(MakeScrollBars);
+   DummyPt.h := 0;
+   DummyPt.v := 0;
+   InitSBList(DocSBList, TheHeap);
+   SBox := SBCreate(DocSBList, HSBNil, V, DummyPt, 0);  { right }
+   SetSBIcons(SBox, [IconArwA, IconArwB, IconThumb, IconPagA, IconPagB]);
+   RightSBox := SBox;
+   SBox := SBCreate(DocSBList, SBox, H, DummyPt, 0);    { bottom (inactive) }
+   SBMade := true;
+end;
+
+{------------------------------------------------------------------------------}
+{  InitNewDoc -- the Filer sent fcNone and lent us a window (theEvent.who).    }
+{  Take it with TakeWindow, fill in the document (the text saved last time,   }
+{  or an empty text on a first launch), and paint it.                         }
+{------------------------------------------------------------------------------}
+procedure InitNewDoc(window: WindowPtr);
+var
+   Contents: PagePtr;
+
+   { an empty text, linked to no file, with the default settings }
+   procedure StartFresh;
+   begin
+      if The.HeadList <> nil then FreeUp(The.HeadList);
+      if not EmptyChain(Contents) then begin
+         TellFiler(schedErr, initFailed, noMemory, nil);
+         Halt
+      end;
+      The.HeadList := Contents;
+      The.HasFile := false;
+      The.FileName := '';
+      The.Changed := false;
+      The.TabsIncr := 8;
+      The.FontStyle := MainFStyle;
+      The.FontSize := MainFSize;
+      The.Select.Left.Ln := 0;
+      The.Select.Left.Ch := 1;
+      The.Select.Right := The.Select.Left;
+      The.DocPosn := 0;
+      The.NumMarkers := 0;
+      TotalKnt;
+      if Last.Data in [CmdCut, CmdCopy, CmdPaste, CmdType] then FreeUp(Last.List);
+      Last.Cmd := CmdNone;      { nothing to undo in a fresh text }
+      Last.Undoable := false;
+      Last.Data := CmdNone;
+   end;
+
+begin
+   myWindow := window;
+   TakeWindow(myWindow);       { claim the window: its events now come to us }
+   Install(myWindow);
+   ClipRect(myWindow^.portRect);
+   GetFldrTitle(myWindow, OrigTitle);   { restored when the window goes back }
+   ShownTitle := OrigTitle;
+   StatusOK := false;
+
+   if The.HeadList = nil then  { not already in memory from an earlier loan }
+      if not LoadWork then StartFresh;
+
+   { Bring the last text back only if it holds work that would otherwise  }
+   { be lost: unsaved changes, or a text never saved to a file.  A text    }
+   { that is safely saved in its .TEXT file is not reopened -- we start    }
+   { fresh and offer the "Open text file" prompt instead (see below).      }
+   if The.HasFile and not The.Changed then StartFresh;
+
+   MakeScrollBars;
+   IsCaretVis := false;
+   CacheLn := - 1;
+
+   { An empty text that was never saved to a file (always the case on the  }
+   { very first launch): offer to open a file.  Not from here -- we are    }
+   { still answering the Filer's fcNone -- but from the main loop's first  }
+   { idle pass.  Clicking in the window cancels the prompt (ReadCh gives   }
+   { up on a click and leaves it queued), and the click then just places   }
+   { the insertion point, so the user starts typing a new text.            }
+   PendingOpen := (not The.HasFile) and (The.LinesTot = 0) and
+                  (PageUsed(The.HeadList^.nxtpage) = 0);
+   if PendingOpen then The.Changed := false;  { nothing there to lose, so  }
+                                              { no "unsaved changes" query }
+
+   { No folderActivate arrives for this first activation                     }
+   { (the Filer hands over an already active window), so put up the menus  }
+   { here ourselves when we are the active folder.                          }
+   IsActive := (activeFolder = myWindow);
+   ValidRect(myWindow^.portRect);
+   ShowAll;
+   if IsActive then begin
+      PutUpMenus;
+      if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
+   end
+   else RefreshMenuState;
+   blnktyme := Time;
+end;
+
+{ Our window goes back to the Filer (it is only lent to us: never }
+{ DisposeFolder it).                                             }
+procedure ForgetWindow;
+begin
+   PendingOpen := false;
+   RestoreTitle;
+   StatusOK := false;
+   if IsActive then begin
+      if IsInsertion then CaretVis(false);
+      IsActive := false;
+   end;
+   myWindow := nil;
+   theFolder := nil;
+end;
+
+{ File/Print: Save & Put Away }
+procedure PutAwayDoc;
+var
+   err: integer;
+   w: WindowPtr;
+   Discard, Ask: boolean;
+   Question: str255;
+begin
+   if myWindow = nil then exit(PutAwayDoc);
+   Discard := false;
+   { Ask when there is something unsaved: changes to a .TEXT file, or a  }
+   { new text that has content but was never saved to a file.            }
+   Ask := false;
+   if The.Changed then
+      if The.HasFile then begin
+         Ask := true;
+         Question := ConCat('Save the changes to "', The.FileName, '"');
+      end
+      else if (The.LinesTot > 0) or (PageUsed(The.HeadList^.nxtpage) > 0) then begin
+         Ask := true;
+         Question := 'Save the new text in a file';
+      end;
+   if Ask then
+      if Confirm(Question) then begin
+         { a new text: DoSaveText asks for the file name; giving none }
+         { (or Clear) cancels the exit and we stay in the editor      }
+         if not DoSaveText(false) then exit(PutAwayDoc);
+      end
+      else if ClickOut then exit(PutAwayDoc)
+      else Discard := true;  { "N": throw the changes away }
+   { Keep the working text for next time -- except after "N": keeping it }
+   { would bring the unwanted changes back (still marked as changed) at  }
+   { the next launch, and the question would be asked again, forever.    }
+   if Discard then KillWork
+   else SaveWork(false);
+   w := myWindow;
+   ForgetWindow;                 { restores the title first }
+   if Discard then FreeUp(The.HeadList);  { also the copy in memory: the  }
+                                          { next launch starts fresh      }
+   TellFiler(err, docClosd, docPutBack, w);
+end;
+
+{------------------------------------------------------------------------------}
+{  HandleFilerOp -- answer a Filer command (the TOOL version of the dispatch: }
+{  fcNone is our launch, everything document-like is refused, close-like      }
+{  commands put our text away).                                               }
+{------------------------------------------------------------------------------}
+procedure HandleFilerOp(var e: EventRecord; var wantsOpen: boolean);
+var
+   fx: FilerExt;
+   err: integer;
+begin
+   wantsOpen := false;
+   GetAddParms(err, e, fx);   { exactly once per filer event }
+   case fx.theFlrOp of
+      fcNone:
+         wantsOpen := true;
+      fcResume:
+         TellFiler(err, docClosd, internalError, e.who);
+      fcClose, fcSuspend, fcShred: begin
+         SaveWork(true);
+         if e.who = myWindow then ForgetWindow;
+         TellFiler(err, docClosd, allOK, e.who);
+      end;
+      fcCopy, fcPut:
+         TellFiler(err, docNotXfered, internalError, e.who);
+      fcDfClose:
+         TellFiler(err, dfClosed, allOK, e.who);
+      fcTerminate:
+         toldToDie := true;   { the text is saved in the main program }
+      otherwise ;
+   end;
+end;
+
+{---------------------------- ProcessEvent ----------------------------}
+procedure ProcessEvent{(var e: EventRecord)};
+var
+   TheMenu, TheItem: integer;
+   HitSB: THSB;
+   HitIcon: TIcon;
+   wantsOpen: boolean;
+begin
+   if (myWindow <> nil) and (e.who = myWindow) then Install(myWindow);
+
+   case e.what of
+
+      buttonDown:
+         if e.who = menuFolder then begin
+            ReadyMenus;
+            SetStdCursor(icrsInactive);
+            MenuSelect(e.where, TheMenu, TheItem);
+            if (TheMenu <> 0) and (TheItem <> 0) then MenuCommand(TheMenu, TheItem)
+            else HiLiteMenu(0);
+         end
+         else if (e.who = myWindow) and IsActive then begin
+            if IsInBody(e.Where) then begin
+               StartCmd(CmdSelect, false);
+               DownTime := e.When;
+               if DownTime <= UpTime + DownDelay then DownWhere := UpWhere
+               else DownWhere := e.Where;
+               if e.ShiftKey then begin
+                  targsize := single;
+                  ExtendSelect(DownWhere);
+               end
+               else begin
+                  if DownTime >= seltyme then targsize := single  { first click }
+                  else if targsize <> beyond then targsize := Succ(targsize); { multi-click }
+                  Select(DownWhere);
+               end;
+               RemoveCursor;
+               seltyme := Time + ClickDelay;
+            end
+            else if FGrowHit(e.Where) then DoGrow(e.Where)
+            else if FSbHit(DocSBList, e.Where, HitSB, HitIcon) then DoScroll(e.Where, HitSB, HitIcon);
+            if IsCaretVis then blnktyme := Time + CaretOnTime
+            else blnktyme := Time + CaretOffTime;
+         end;
+
+      buttonUp: begin
+         UpTime := e.When;
+         if UpTime <= DownTime + UpDelay then UpWhere := DownWhere
+         else UpWhere := e.Where;
+      end;
+
+      keyDown:
+         if IsActive and (myWindow <> nil) then begin
+            Install(myWindow);
+            if e.AppleKey then begin
+               ReadyMenus;
+               MenuKey(e.Ascii, TheMenu, TheItem);
+               if TheMenu <> 0 then begin
+                  HiLiteMenu(TheMenu);
+                  MenuCommand(TheMenu, TheItem);
+               end;
+            end
+            else if e.Ascii in CmdChrs then DoCmdChr(e)
+            else if Typeable(e.Ascii) then begin
+               DoTypeIn(e.Ascii);
+               CaretVis(true);
+               blnktyme := Time + minblink;
+               repeat until Time - blnktyme >= 0; { show the caret at least briefly }
+               blnktyme := Time + CaretOnTime - minblink;
+               seltyme := - 1; { cancel double click }
+            end;
+         end;
+
+      folderActivate: begin
+         TakeControl(e, false, false);  { completes the WM's two-process handshake }
+         if (myWindow <> nil) and (e.who = myWindow) then begin
+            Install(myWindow);
+            IsActive := true;
+            StartCmd(CmdActivate, false);
+            PutUpMenus;
+            DrawFolder;
+            if IsSelection then InvSelection(The.Select.Left, The.Select.Right)
+            else IsCaretVis := false;
+            blnktyme := Time;
+         end;
+      end;
+
+      folderDeactivate: begin
+         if (myWindow <> nil) and (e.who = myWindow) and IsActive then begin
+            Install(myWindow);
+            StartCmd(CmdDeactivate, false);
+            if IsSelection then InvSelection(The.Select.Left, The.Select.Right)
+            else if IsInsertion then CaretVis(false);
+            UnDrawFolder;
+            IsActive := false;
+            SetStdCursor(icrsInactive);
+         end;
+         GiveControl(e);   { mandatory: hands activation on }
+      end;
+
+      folderUpdate:
+         if (myWindow <> nil) and (e.who = myWindow) then begin
+            Install(myWindow);
+            if IsActive then CaretVis(false);
+            BeginUpdate(myWindow);
+            ClipRect(myWindow^.PortRect);
+            EraseRect(myWindow^.PortRect);
+            if IsActive then DrawFolder else UnDrawFolder;
+            PaintDoc(The.DocPosn);
+            EndUpdate(myWindow);
+            ClipToText;
+         end
+         else begin  { not ours (any more): consume it }
+            BeginUpdate(e.who);
+            EndUpdate(e.who);
+         end;
+
+      filerEvent: begin
+         HandleFilerOp(e, wantsOpen);
+         if wantsOpen then InitNewDoc(e.who);
+      end;
+
+      otherwise
+         { folderMoved, abortEvent, diedEvent, diskEvent, catalogEvent, }
+         { nilEvent, private events: nothing to do                       }
+   end;
+end; { ProcessEvent }
+
+{$S }
+
+{------------------------------------------------------------------------------}
+{  Initialize -- one-time bring-up between OpenWM and the event loop.  Every  }
+{  failure must TellFiler(initFailed) and halt: the Filer is waiting for us.  }
+{------------------------------------------------------------------------------}
+
+{$S LTEInit }
+
+procedure InitDeskFont;
+var
+   FInfo: FontInfo;
+   ErrNum: integer;
+begin
+   DeskStyle.Fam := SysText;
+   DeskStyle.SetEFace := [];
+   DeskStyle.Dev := DevScreen;
+   if FMFontMetrics(DeskStyle, FInfo, ErrNum) then
+      with FInfo do begin
+         BoxHeight := Ascent + Descent + 12;
+         BoxVOffset := (BoxHeight + Ascent - Descent) div 2;
+         BoxHOffset := WidMax;
+      end
+   else begin
+      BoxHeight := 24;
+      BoxVOffset := 16;
+      BoxHOffset := 8;
+   end;
+end;
+
+procedure Initialize;
+var
+   err, junk, cutAt: integer;
+   pcInfo: procinfoRec;
+   excName: t_ex_name;
+   StoreAddr: LongInt;
+begin
+   initing := true;
+   ioNest := 0;
+
+   { (1) FIRST: the terminate handler (it calls ImDying) }
+   excName := 'SYS_TERMINATE';
+   Declare_Excep_Hdl(err, excName, @LastWishes);
+   if err <> 0 then begin
+      TellFiler(err, initFailed, noMemory, nil);
+      Halt
+   end;
+
+   { (2) known state }
+   toldToDie := false;
+   myWindow := nil;
+   theFolder := nil;
+   SBMade := false;
+   The.HeadList := nil;
+   scraplist := nil;
+   IsActive := false;
+   IsCaretVis := false;
+   Target := '';
+   TokenMode := false;
+   MatchCase := false;
+   WrapSearch := true;
+   seltyme := - 1;
+   blnktyme := 0;
+   targsize := single;
+   Last.Cmd := CmdNone;
+   Last.Undoable := false;
+   Last.Data := CmdNone;
+   UpDelay := 15;
+   DownDelay := 15;
+   UpTime := - 1;
+   DownTime := - 1;
+   CacheLn := - 1;
+   StatusOK := false;
+   PendingOpen := false;
+   ShowNums := false;
+   MarginW := 0;
+   The.NumMarkers := 0;
+   DigitW := 7;
+   OrigTitle := '';
+   ShownTitle := '';
+   The.FontStyle := MainFStyle;
+   The.FontSize := MainFSize;
+   The.TabsIncr := 8;
+   The.DocPosn := 0;
+   The.ElevPosn := 0;
+   The.LinesVis := 1;
+   The.VertSp := 12;
+
+   { (3) the private heap (menus, alert cache, scroll bars, regions) }
+   InitHeap(@myZone[0], @myZone[maxHeap], @OutOfHeapSpace);
+
+   { (4) who am I?  Our installed name is "<stem>-(Tnnn)obj" -- the      }
+   {     number in braces, see the MAKE file; everything we own hangs off }
+   {     that name up to and including the closing brace (no tool number  }
+   {     appears in this source)                                          }
+   BeginIO;
+   Info_Process(err, My_ID, pcInfo);
+   EndIO;
+   cutAt := pos('}', pcInfo.progpathname);
+   if (err <> 0) or (cutAt = 0) or (cutAt > 40) then begin
+      TellFiler(err, initFailed, internalError, nil);
+      Halt
+   end;
+   myPrefix := copy(pcInfo.progpathname, 1, cutAt);
+   workPath := concat(myPrefix, 'work text');
+   storePath := concat(myPrefix, 'text store');
+
+   { (5) menus (and the two required alerts) from "<prefix>PHRASE" }
+   InitMP(theHeap, myPrefix, @AlertFailed, alertVerNum, @myMenus[mFile], allAlerts, err);
+   if err > 0 then begin
+      TellFiler(err, initFailed, noMemory, nil);
+      Halt
+   end;
+
+   { (5a) the Print Manager: AFTER InitMP (it needs the Alert Manager).    }
+   {      The print record stays invalid until the first print command.   }
+   PrMgrInit;
+   prRec.PrVersion := 0;
+
+   { (6) cursors and scroll bars }
+   InitWmlCrs(err);
+   if err <> 0 then begin
+      TellFiler(err, initFailed, internalError, nil);  { not noDiskSpace: keep }
+                                                       { the two causes apart  }
+      Halt
+   end;
+   InitWmlSb;
+
+   SetPort(deskPort);
+   InitDeskFont;
+   DummyRgn := NewRgn;
+
+   { (7) the Store: a heap zone in its own (scratch) data segment holds the }
+   {     text pages; it grows on demand (StoreError -> GrowHeap)           }
+   BeginIO;
+   Kill_DataSeg(junk, storePath);
+   Make_DataSeg(err, storePath, StoreSize, StoreSize, StoreRefNum, StoreAddr,
+                storeLDSN, ds_private);
+   EndIO;
+   if err > 0 then begin
+      TellFiler(err, initFailed, noDiskSpace, nil);
+      Halt
+   end;
+   Store := HzInit(Pointer(StoreAddr), Pointer(StoreAddr + StoreSize), nil, 50, 0,
+                   @StoreError, nil, nil, nil);
+
+   { (8) the scratch page used for typing }
+   if not NewClearPage(insertpg) then begin
+      TellFiler(err, initFailed, noMemory, nil);
+      Halt
+   end;
+
+   initing := false;
+end; { Initialize }
+
+{$S }
+
+
+{==============================================================================}
+{  The main program: the two-phase loop of every LOS application              }
+{==============================================================================}
+
+begin
+   InitGraf(@thePort);    { QuickDraw for this process }
+   OpenWM;                { attach to the Window Manager }
+   Initialize;
+
+   repeat
+      { Phase A: not the active window -- wait (GetEvent may suspend us) }
+      while not (ImActive or toldToDie) do begin
+         GetEvent(theEvent);
+         ProcessEvent(theEvent);
+      end;
+
+      { Phase B: active -- poll; when idle blink the caret, track the }
+      { cursor, and always let the other processes run                 }
+      while ImActive and (not toldToDie) do begin
+         if EventAvail then begin
+            GetEvent(theEvent);
+            ProcessEvent(theEvent);
+         end
+         else begin
+            if IsActive and (myWindow <> nil) then begin
+               if PendingOpen then begin   { see InitNewDoc }
+                  PendingOpen := false;
+                  Install(myWindow);
+                  DoOpenText;
+               end;
+               TrackCursor;
+               Install(myWindow);
+               if IsInsertion and (Time >= blnktyme) then begin
+                  CaretVis(not IsCaretVis);
+                  if IsCaretVis then blnktyme := Time + CaretOnTime
+                  else blnktyme := Time + CaretOffTime;
+               end;
+               DrawStatus(false);   { only draws when the selection moved }
+               FitMargin;           { e.g. typing a Return brought line 100 }
+            end;
+            LetOthersRun;
+         end;
+      end;
+   until toldToDie;
+
+   { fcTerminate: keep the text for next time, release the Store.  Falling }
+   { off the end fires SYS_TERMINATE -> LastWishes -> ImDying.              }
+   SaveWork(true);
+   BeginIO;
+   Close_DataSeg(schedErr, StoreRefNum);
+   Kill_DataSeg(schedErr, storePath);
+   EndIO;
+end.

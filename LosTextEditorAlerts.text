@@ -1,0 +1,124 @@
+; =============================================================================
+;  LosTextEditorAlerts.text -- the phrase-file SOURCE for LosTextEditor.
+;
+;  Compiled by the Workshop 'Alert' tool into the binary <tool>PHRASE file
+;  that InitMP reads at run time (see LosTextEditorMake.text).  Format rules:
+;    - a comment must occupy its OWN line;
+;    - blank lines are STRUCTURAL: one ends the button block, one ends each
+;      alert's text, one ends each menu block -- do not add extras;
+;    - alert numbers strictly ascending; #1 and #2 are REQUIRED;
+;    - the alert section and the menu section each end with a lone 0.
+;
+;  Menu ids and item positions must match the m*/mi* constants in
+;  LosTextEditor.text -- a '-' separator line COUNTS as an item.
+; =============================================================================
+;
+; Version stamp: must equal alertVerNum in LosTextEditor.text.
+; (2: the Print menu, menu 5, was added; 3: the Markers menu, menu 6)
+3
+; cacheSize and cacheBytes for InitAlerts (the Alert tool prints suggested
+; values when it compiles this file; paste them here if it complains).
+4
+2000
+; The five icon strings: ask, wait, stop, note, caution.
+?
+Wait
+Stop
+Note
+Caution
+; Button captions: index 0 MUST be Cancel, index 1 MUST be OK.
+Cancel
+OK
+
+; ==== ALERTS =================================================================
+;
+; -- #1 REQUIRED: shown for an alert number that is not in this file.
+1 note alert
+The Text Editor could not find the message that should appear here.  If you
+are unable to proceed, contact a qualified service representative, and mention
+the number ^N.
+
+; -- #2 REQUIRED: the "Swan Song", kept in cache for disk/memory failures.
+2 stop alert
+The Text Editor is having technical difficulties accessing the disk that
+contains the Text Editor tool.^L^L
+Put away your documents one at a time, or push the on-off button to save
+them all.
+
+0
+; ==== MENUS ==================================================================
+; Read by InitMP into myMenus[1..6].  Each block: menuId, title, one item per
+; line ('/X' = Apple-key equivalent, '-' = separator), ended by a blank line.
+1
+File
+Set Aside Everything
+Set Aside "Text Editor"
+-
+Save & Put Away
+-
+New Text File
+Open Text File .../O
+Save Text File
+Save Text File As ...
+Revert to Saved Text File
+-
+Exit Editor/Q
+
+2
+Edit
+Undo Last Change
+-
+Cut/X
+Copy/C
+Paste/V
+-
+Shift Left/L
+Shift Right/R
+-
+Set Tabs ...
+-
+Select All/A
+-
+Show Line Numbers
+
+3
+Search
+Find .../F
+Find Same/S
+Find & Paste All ...
+-
+Whole Words Only
+Match Case
+Wrap Around
+-
+Go to Line .../G
+Show Insertion Point
+
+4
+Type Style
+Modern
+Classic
+-
+20 Pitch (8 Point)
+15 Pitch (8 Point)
+12 Pitch (10 Point)
+10 Pitch (12 Point)
+Proportional (12 Point)
+Proportional (18 Point)
+
+5
+Print
+Format for Printer ...
+Print .../P
+Print Selection ...
+-
+Monitor the Printer ...
+
+6
+Markers
+Set Marker ...
+Delete Marker ...
+-
+Go to Marker .../M
+
+0

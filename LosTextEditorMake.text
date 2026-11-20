@@ -1,0 +1,74 @@
+$EXEC
+${=============================================================================}
+${ LosTextEditorMake.text -- build driver for LosTextEditor.                  }
+${ Run it in the Workshop with R, then <LosTextEditorMake                    }
+${   1. compile LosTextEditor.text                                            }
+${   2. link it with the standard runtime libraries                           }
+${   3. copy the executable and ICON.BIN to tool names T197000 Obj / ICON    }
+${   4. compile the phrase file (menus) to   T197000PHRASE                       }
+${   5. InstallTool: register tool 197000 "Text Editor" with the Office System   }
+${ The tool number lives ONLY in this file (the program finds its own number  }
+${ from its pathname at run time).  To renumber, change every 197000 below.      }
+${ A line holding only a comment emits a bare [RETURN] -- used on purpose.    }
+${=============================================================================}
+${                                                                            }
+${ Delete stale outputs first: a stale .OBJ silently poisons a build.         }
+F{ilemgr}D{elete}LOSTEXTEDITOR_COMPILED.OBJ  Y{es}
+        D{elete}LOSTEXTEDITOR.OBJ  Y{es}
+        Q{uit}
+${                                                                            }
+${ 1. Compile: source / no listing / object.                                  }
+P{ascal Compile}LOSTEXTEDITOR.TEXT
+{no listing file - this comment-only line IS the [RETURN] answer}
+LOSTEXTEDITOR_COMPILED.OBJ
+${                                                                            }
+${ 2. Link.  The intrinsic units (QuickDraw, WM, WMLsb, WMLgrow, AlertMgr,     }
+${ FilerComm ...) resolve through INTRINSIC.LIB; IOSPASLIB is the Pascal      }
+${ runtime, SYS1LIB/SYS2LIB the window-manager side.                          }
+${ PRLIB is the printing library (the code behind PrPublic).  The editor      }
+${ does not print; PRLIB is linked only in case FilerComm or PrStdInfo        }
+${ (both in the uses list) refer to printing code.  The linker takes only     }
+${ the modules that are called, so if nothing calls into PRLIB it adds        }
+${ nothing.  To drop it, delete the PRLIB.OBJ line below; if the link then    }
+${ reports unresolved print-related names, put it back.                       }
+${ Success is the linker's line 'The output is executable.'                   }
+L{inker}LOSTEXTEDITOR_COMPILED.OBJ
+IOSPASLIB.OBJ
+SYS1LIB.OBJ
+SYS2LIB.OBJ
+PRLIB.OBJ
+{end of the input list - this comment-only line is the blank [RETURN] answer}
+{no listing file - second blank answer}
+LOSTEXTEDITOR.OBJ
+${                                                                            }
+${ 3. Install the executable and the desktop icon under the tool name.      }
+${    ICON.BIN must be on the disk: it is made on the PC from               }
+${    icon2_48x32.png by png2lisaicon.py (a 3-character QuickDraw font:     }
+${    the Filer loads T197000 ICON with FMAddFont and draws char 1, the    }
+${    picture, over char 2, its mask).                                    }
+F{ilemgr}D{elete}~{T197000~}Obj
+Y{es}D{elete}~{T197000~}PHRASE
+Y{es}D{elete}~{T197000~}ICON
+Y{es}C{opy}LOSTEXTEDITOR.OBJ
+~{T197000~}Obj
+C{opy}ICON.BIN
+~{T197000~}ICON
+Q{uit}
+${                                                                            }
+${ 4. Compile the phrase file straight to its installed name (the Alert tool  }
+${ appends 'PHRASE' to the stem we give it).                                  }
+R{un}Alert
+LOSTEXTEDITORALERTS.TEXT
+~{T197000~}
+${                                                                            }
+${ 5. Register with the Office System.  For a tool that does NOT make         }
+${ documents InstallTool asks EXACTLY SIX questions -- one answer per line.   }
+R{un}InstallTool
+Y              {1: overwrite an existing tool with the same number}
+{2: blank = the PARAPORT device -- this comment-only line is the [RETURN]}
+197000            {3: the tool number}
+N              {4: does NOT make documents}
+N              {5: no special opening rectangle}
+Text Editor
+${ ^ 6: the name shown on the desktop.  Left bare: the name is read verbatim. }
+$ENDEXEC

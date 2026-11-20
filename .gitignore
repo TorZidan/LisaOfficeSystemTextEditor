@@ -1,0 +1,11 @@
+# Python bytecode caches
+__pycache__/
+
+upload_sources_to_profile_for_testing.sh
+profile-5MB-LOSAndWorkshop3-DoNotCommit-ForTesting.image
+profile-5Mb-FreshInstallOf-LOS3AndWorkshop3.image
+lisaem.conf
+installtool.obj
+alert.obj
+diff.obj
+*.log
