@@ -1,13 +1,23 @@
 # Text Editor for the Lisa Office System
 
-A plain-text editor that runs as a tool on the Apple Lisa Office System (LOS 3.1). It edits Lisa
-Workshop text files (`.TEXT`), so the same files can be used with the Lisa Workshop, and it keeps
-whatever you were working on when you set it aside.
+A text editor application for Apple Lisa Office System (LOS 3.1), similar to the one found in Lisa Workshop.
+It edits Lisa text files (`.TEXT`).
 
-![The Text Editor on the Lisa Office System desktop](screenshot.png)
+Apple chose to have their text editor app only in Workshop (the Lisa Office System development environment).
+Now you can edit them directly in Lisa Office System with this app.
 
-*A new text in the Text Editor: the menus along the top, the file name in the title bar, the
-position of the insertion point in the status line at the bottom.*
+Lisa Office System and the Workshop development environment share the same file system at startup: 
+there is a "dual boot" dialog named the "Environments Selector", where you can choose which environment to start.
+This means that if you edit a text file in Workshop, you can "see" the changes in LOS, and vice versa.
+
+Note: the "Environments Selector" is available only if both LOS and Workshop are installed on the same ProFile hard disk,
+and only if a "default environment" has not been chosen in that dialog. 
+If the "Environments Selector" does not show up at boot time,
+press any key when the Lisa starts booting up (after the BIOS startup screen).
+
+The Text Editor running in Lisa Office System:
+
+![The Text Editor running in Lisa Office System](screenshot.png)
 
 ## Contents
 
@@ -24,35 +34,24 @@ position of the insertion point in the status line at the bottom.*
 
 ## Installing
 
-The Text Editor is built with the Lisa Workshop 3.0 and installed as Office System tool number
-**197000**. Copy these files to the Workshop disk:
+The DC42 floppy disk image file [`LosTextEditor.dc42`](LosTextEditor.dc42) contains the
+text editor app. Boot into Lisa Office System (LOS 3.1) then insert ("mount") that
+disk image, e.g. using a FloppyEmu or ESFloppy floppy disk hardware
+emulator on a real Lisa, or in the [LisaEm](https://lisaem.sunder.net/) emulator, from the **File -> Insert Diskette** menu item.
+Open the floppy disk icon; you will see the "Text Editor" app  icon in there. Figure out how to copy it
+to your ProFile hard drive, or launch it from the floppy disk.
 
-| File | What it is |
-|---|---|
-| `LosTextEditor.text` | the program |
-| `LosTextEditorAlerts.text` | the menus (the "phrase file") |
-| `LosTextEditorMake.text` | the build script |
-| `ICON.BIN` | the desktop icon (copy it unchanged, as a binary file) |
-
-Then, in the Workshop, choose **R**un and type `<LosTextEditorMake`. The script compiles and links the program,
-installs it together with its menus and icon, and registers it with the Office System as
-"Text Editor". Restart the Office System afterwards: the desktop keeps a tool's icon in memory until
-it is restarted.
 
 ## Starting the Text Editor
 
-Open the **Text Editor** icon on the desktop.
+Open the **Text Editor** icon on the desktop by double0clicking on it or select the icon with your mouse and then choose the File/Print->Open Text Editor menu.
 
-When there is nothing to come back to, the editor asks at once in the dialog bar under the menu bar:
-
-```
-Open text file named ?
-```
+Upon start, the editor pops a prompt under the menu bar: `Open text file named ?`
 
 - Type a file name and press **Return** to open it.
-- Or simply **click in the window**: the question goes away and you can start typing a new text.
+- Or simply **click in the editor window**: the prompt goes away and you can start typing a text into a new file.
 
-If you set the editor aside with unsaved work, it comes back exactly as you left it instead (see
+If you set the editor aside with unsaved work, it comes back exactly as you left it (see
 [What is kept, and when](#what-is-kept-and-when)).
 
 ## The window

@@ -41,10 +41,24 @@ The Python tools use only the Python 3 standard library.
 
 ## 2. Building and installing
 
+
+
 Requirements: Lisa Workshop 3.0 with the Office System 3.1 libraries (`IOSPASLIB`, `SYS1LIB`,
 `SYS2LIB`, `PRLIB` and `INTRINSIC.LIB`).
 
-`<LosTextEditorMake` (`LosTextEditorMake.text`) does, in order:
+The Text Editor is built with the Lisa Workshop 3.0 and installed as Office System tool number
+**197000**. Copy these files to the Workshop disk:
+
+| File | What it is |
+|---|---|
+| `LosTextEditor.text` | the program |
+| `LosTextEditorAlerts.text` | the menus (the "phrase file") |
+| `LosTextEditorMake.text` | the build script |
+| `ICON.BIN` | the desktop icon (copy it unchanged, as a binary file) |
+
+Then, in the Workshop, choose **R**un and type `<LosTextEditorMake` to run it as a "macro".
+
+`<LosTextEditorMake` (`LosTextEditorMake.text`) runs the following steps, in order:
 
 1. Deletes stale `LOSTEXTEDITOR_COMPILED.OBJ` and `LOSTEXTEDITOR.OBJ`.
 2. Compiles `LOSTEXTEDITOR.TEXT` to `LOSTEXTEDITOR_COMPILED.OBJ`.
@@ -53,7 +67,8 @@ Requirements: Lisa Workshop 3.0 with the Office System 3.1 libraries (`IOSPASLIB
    Manager declarations …) are resolved through `INTRINSIC.LIB`.
 4. Copies the executable to `{T197000}Obj` and `ICON.BIN` to `{T197000}ICON`.
 5. Runs the Alert tool on `LOSTEXTEDITORALERTS.TEXT`, producing `{T197000}PHRASE`.
-6. Runs InstallTool: tool 197000, no documents, default window, name "Text Editor".
+6. Runs InstallTool: tool 197000, no documents, default window, name "Text Editor". This produces the LOS executable file {T197000}Obj ;
+oce you reboot into LOS, it will automatically show up as a separate icon labeled "Text Editor" on the ProFile hard drive.
 
 **The tool number appears only in `LosTextEditorMake.text`.** At run time the program reads its own pathname
 (`Info_Process`), keeps everything up to the closing brace (`<volume>-{T197000}`), and derives all its
@@ -64,6 +79,7 @@ integers in the Filer, and InstallTool accepts numbers above 32767.
 Exec-file pitfalls: curly braces are comments in exec files (write `~{` and `~}` to pass a brace on),
 comments do not nest (`${ … {T197000} … }` breaks the line), and a line holding only a comment emits a
 bare RETURN, which the script uses on purpose for "no listing" and "default device" answers.
+
 
 ## 3. Lisa Pascal rules that matter here
 
