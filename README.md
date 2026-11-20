@@ -4,6 +4,11 @@ A plain-text editor that runs as a tool on the Apple Lisa Office System (LOS 3.1
 Workshop text files (`.TEXT`), so the same files can be used with the Lisa Workshop, and it keeps
 whatever you were working on when you set it aside.
 
+![The Text Editor on the Lisa Office System desktop](screenshot.png)
+
+*A new text in the Text Editor: the menus along the top, the file name in the title bar, the
+position of the insertion point in the status line at the bottom.*
+
 ## Contents
 
 - [Installing](#installing)
