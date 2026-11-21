@@ -32,6 +32,10 @@ The Text Editor running in Lisa Office System:
 - [What is kept, and when](#what-is-kept-and-when)
 - [Limits](#limits)
 
+Is this new text editor app any useful at all? I think that the whole development process of LOS applications can be moved from Workshop directly into LOS.
+Providing a text editor in LOS is the first step towards that. The next step would be to implement a Workshop-like app for LOS where you can execute Workshop apps (e.g. the Pascal compiler). This is certainly feasible and possible. With this, you no-longer need to reboot between Workshop and LOS to edit/compile/link/run your app.
+The question is if the extra RAM used by LOS may cause some Workshop apps to run out of memory (and crash LOS and exit into LisaBug).
+
 ## Installing
 
 The DC42 floppy disk image file [`LosTextEditor.dc42`](LosTextEditor.dc42) contains the
