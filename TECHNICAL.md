@@ -36,6 +36,7 @@ How the Text Editor is built and how the code in `LosTextEditor.text` works. For
 | `icon2_48x32.png` | The icon picture at Lisa size, 48 × 32, black and white. |
 | `png2lisaicon.py` | Converts a 48 × 32 PNG into an icon file such as `ICON.BIN`. |
 | `audit_8char.py` | Checks the program for identifier clashes (see [§3](#3-lisa-pascal-rules-that-matter-here)). |
+| `LisaOsTextFileSpecification.txt` | Apple's definition of a text file, which the editor follows (see [§11](#11-the-text-file-format)). |
 
 The Python tools use only the Python 3 standard library.
 
@@ -312,13 +313,26 @@ A Workshop text file is a sequence of 1 KB pages (two 512-byte blocks each):
   The rest of the header page is kept as read, so data written there by other programs survives a save.
 
 - **Text pages.** Lines end with CR; no line crosses a page; the page is padded with NUL. Leading
-  blanks are compressed: **DLE** (`chr(16)`) followed by `chr(32 + n)` stands for n spaces. Trailing
-  blanks are dropped on write.
+  blanks are compressed: **DLE** (`chr(16)`) followed by `chr(32 + n)` stands for n spaces. One code
+  holds at most 223 spaces (`maxDLE`, so the count byte stays ≤ 255); the rest of a longer indent is
+  written as plain spaces after it. Trailing blanks are dropped on write.
 
 `ReadFile` reads 4 pages at a time with `blockread`, expands DLE, forces a CR at line ends and builds
 the page list (`AppendLn`/`EndChain`). `WriteFile` updates the header in the header page, compresses
 leading blanks and writes with `blockwrite`; the file is closed with `CRUNCH` (or `PURGE` after an
 error). File names get `.TEXT` appended when missing (`CheckTitle`).
+
+The reader and the writer conform to Apple's text-file definition in
+[`LisaOsTextFileSpecification.txt`](LisaOsTextFileSpecification.txt) (from the *Lisa Development
+System Internals Documentation*, February 1984, pages 37–38). Files are written as the specification
+requires: whole CR-terminated lines per page, each page ending in at least one NUL, DLE-compressed
+leading blanks, and an empty text saved as the header page alone. The reader takes the robustness
+rules into account: it never reads past a page buffer, adds a missing final CR, and warns instead of
+failing on odd block counts or pages that do not end in NUL. The specification allows a tool to
+consider only the first 255 characters of a line, and the editor does so: a longer line is cut
+when it is read, with a warning (see the limits in the README). Two choices go beyond the
+specification without breaking it: trailing blanks are dropped on write, and NULs are skipped on
+read, so a page ends at its last CR rather than at the first CR-NUL pair.
 
 ## 12. The working copy (saved-text data segment)
 

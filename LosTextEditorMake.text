@@ -25,12 +25,10 @@ ${                                                                            }
 ${ 2. Link.  The intrinsic units (QuickDraw, WM, WMLsb, WMLgrow, AlertMgr,     }
 ${ FilerComm ...) resolve through INTRINSIC.LIB; IOSPASLIB is the Pascal      }
 ${ runtime, SYS1LIB/SYS2LIB the window-manager side.                          }
-${ PRLIB is the printing library (the code behind PrPublic).  The editor      }
-${ does not print; PRLIB is linked only in case FilerComm or PrStdInfo        }
-${ (both in the uses list) refer to printing code.  The linker takes only     }
-${ the modules that are called, so if nothing calls into PRLIB it adds        }
-${ nothing.  To drop it, delete the PRLIB.OBJ line below; if the link then    }
-${ reports unresolved print-related names, put it back.                       }
+${ PRLIB is the printing library: the code behind PrPublic, which the Print   }
+${ menu uses (the print dialogs, PrDocStart/PrPageStart/PrPageEnd/PrDocEnd,   }
+${ the print queue).  It is required: without it the link reports these       }
+${ names as unresolved.                                                       }
 ${ Success is the linker's line 'The output is executable.'                   }
 L{inker}LOSTEXTEDITOR_COMPILED.OBJ
 IOSPASLIB.OBJ

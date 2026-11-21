@@ -93,6 +93,7 @@ const
    cr = chr(13);        { new line with auto-indent        }
    tab = chr(9);
    dle = chr(16);       { blank compression in .TEXT files }
+   maxDLE = 223;        { most blanks one DLE code holds: 32 + 223 = 255 }
    nul = chr(0);
    EnterCh = chr(3);    { new line without auto-indent     }
    ClearCh = chr(27);   { <Escape>/<Clear>: cancels a prompt }
@@ -3531,11 +3532,17 @@ var
       blksused := blksused + pageblks;
    end;
 
+   { LineLength counts the text and its CR; LineIndent the leading blanks. }
+   { Two or more blanks become DLE + count; the count byte holds at most  }
+   { maxDLE blanks, so the rest of a longer indent is written as blanks.   }
    procedure PutLine(LineIndent, LineLength: integer; LastLine: Boolean);
    var
-      Size: integer;
+      Size, nDLE, J: integer;
    begin
-      Size := LineLength + CMin(LineIndent, 2);
+      nDLE := 0;
+      if LineIndent >= 2 then nDLE := CMin(LineIndent, maxDLE);
+      Size := LineLength + LineIndent;
+      if nDLE > 0 then Size := Size - nDLE + 2;
       if LastLine or (LineEnd + Size >= pagemax) then begin
          while LineEnd <= pagemax do begin
             CurrPtr^[LineEnd] := Nul;
@@ -3546,12 +3553,12 @@ var
       end;
       LineBeg := LineEnd;
       LineEnd := LineBeg + Size;
-      if LineIndent >= 2 then begin
+      if nDLE > 0 then begin
          CurrPtr^[LineBeg] := DLE;
-         CurrPtr^[LineBeg + 1] := Chr(LineIndent + 32);
+         CurrPtr^[LineBeg + 1] := Chr(nDLE + 32);
          LineBeg := LineBeg + 2;
-      end
-      else if LineIndent = 1 then begin
+      end;
+      for J := 1 to LineIndent - nDLE do begin
          CurrPtr^[LineBeg] := ' ';
          LineBeg := LineBeg + 1;
       end;
