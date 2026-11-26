@@ -25,7 +25,7 @@
 # Environment:
 #   LISA_PASCAL   the LisaPascalCrossCompiler folder (default: next to this
 #                 project, ../LisaPascalCrossCompiler)
-#   LISA_BOOT     the boot volume folder (default: $LISA_PASCAL/boot-workshop3.0)
+#   LISA_BOOT     the boot volume folder (default: $LISA_PASCAL/libs/workshop3.0)
 #   DC42_IMAGE    the floppy image to install the tool on
 #   BUILD_DIR     where the outputs go (default: build)
 #   LPC_OPTS      more options for pascal/lpc.py, e.g. --2.0 (the 2.0 build)
@@ -50,7 +50,7 @@ LISA_PASCAL=$(cd "$LISA_PASCAL" && pwd)
 [ -f "$LISA_PASCAL/pascal/lpc.py" ] || die "no pascal/lpc.py in $LISA_PASCAL (set LISA_PASCAL)"
 [ -f "$LISA_PASCAL/pascal/audit_8char.py" ] || die "no pascal/audit_8char.py in $LISA_PASCAL"
 command -v python3 > /dev/null || die "python3 is needed"
-export LISA_BOOT=${LISA_BOOT:-$LISA_PASCAL/boot-workshop3.0}
+export LISA_BOOT=${LISA_BOOT:-$LISA_PASCAL/libs/workshop3.0}
 FS_TOOLS=$LISA_PASCAL/file-system-tools       # LisaFileSystemTool.py, LisaFileSystemToolPerFile.py
 ICON_TOOL=$LISA_PASCAL/icon-tool/png2lisaicon.py
 [ -f "$FS_TOOLS/LisaFileSystemToolPerFile.py" ] || die "no LisaFileSystemToolPerFile.py in $FS_TOOLS"

@@ -15,9 +15,13 @@ and only if a "default environment" has not been chosen in that dialog.
 If the "Environments Selector" does not show up at boot time,
 press any key when the Lisa starts booting up (after the BIOS startup screen).
 
-The Text Editor running in Lisa Office System:
+The Text Editor running in Lisa Office System, on the LisaEm emulator:
 
-![The Text Editor running in Lisa Office System](screenshot.png)
+![The Text Editor running in Lisa Office System, on the LisaEm emulator](screenshot.png)
+
+The Text Editor running on a real Apple Lisa:
+
+![The Text Editor running on a real Apple Lisa](TheTextEditorRunningInLisaOfficeSystem.jpg)
 
 ## Contents
 

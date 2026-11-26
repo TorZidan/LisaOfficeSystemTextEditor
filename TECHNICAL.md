@@ -87,7 +87,7 @@ bare RETURN, which the script uses on purpose for "no listing" and "default devi
   unit's `CheckMark` are the *same* identifier. Run
   `python3 ../LisaPascalCrossCompiler/pascal/audit_8char.py LosTextEditor.text` after every change:
   it compares every program-level name against each other, against the interfaces of the 18 units in
-  the `uses` list (read from `boot-workshop3.0`), and against exported library entry points.
+  the `uses` list (read from `libs/workshop3.0`), and against exported library entry points.
 - **A `var` parameter needs exactly the declared type.** Two separately declared `string[255]` types
   are different types; therefore `FileStr = str` is declared as an alias of `str`.
 - **4-digit hex constants are 16-bit integers**: `$8000` is −32768. Long constants are written with 8
