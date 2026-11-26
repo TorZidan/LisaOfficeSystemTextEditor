@@ -1,11 +1,12 @@
 # Python bytecode caches
 __pycache__/
 
+build
+
 upload_sources_to_profile_for_testing.sh
+
+# How I run LisaEm in this folder: ~/github/lisaem-fork3/bin/lisaem  -c ./lisaem.conf  -p
 profile-5MB-LOSAndWorkshop3-DoNotCommit-ForTesting.image
 profile-5Mb-FreshInstallOf-LOS3AndWorkshop3.image
 lisaem.conf
-installtool.obj
-alert.obj
-diff.obj
 *.log

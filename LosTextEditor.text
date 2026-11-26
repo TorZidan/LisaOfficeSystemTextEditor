@@ -1,45 +1,42 @@
 {==============================================================================}
 {                                                                              }
-{  LosTextEditor.text  --  program LosTextEditor                               }
+{  LosTextEditor.text  --  LOS "Text Editor" desktop app.                      }
 {                                                                              }
-{  A plain-text editor that runs as a tool under the Lisa Office System       }
-{  (LOS 3.1).  It edits Lisa Workshop text files (.TEXT).  See README.md for  }
-{  the user guide and TECHNICAL.md for a description of this code.            }
+{  A plain-text-file editor that runs as a tool under the Lisa Office System   }
+{  (LOS 3.1).  It edits Lisa Workshop text files (.TEXT).  See README.md for   }
+{  the user guide and TECHNICAL.md for a description of this code.             }
 {                                                                              }
 {  THE OFFICE SYSTEM SIDE                                                      }
 {    - the Filer launches us; InitGraf + OpenWM + Initialize;                  }
-{    - the Filer lends us a window with an fcNone filer event, and            }
+{    - the Filer lends us a window with an fcNone filer event, and             }
 {      InitNewDoc takes it with TakeWindow();                                  }
 {    - the two-phase event loop (blocked GetEvent while inactive, polling      }
 {      plus LetOthersRun while active);                                        }
 {    - menus come from a phrase file (InitMP), built by the Alert tool;        }
-{    - Filer commands are answered with TellFiler; fcTerminate ends the loop; }
+{    - Filer commands are answered with TellFiler; fcTerminate ends the loop;  }
 {    - the SYS_TERMINATE handler calls ImDying FIRST.                          }
 {                                                                              }
 {  THE EDITOR SIDE                                                             }
-{    - the text is a chain of 1K pages in a heap zone of its own (the Store), }
+{    - the text is a chain of 1K pages in a heap zone of its own (the Store),  }
 {      lines ending in CR, addressed by line/column Places;                    }
-{    - selection, typing, Cut/Copy/Paste (private clipboard), one-level Undo  }
+{    - selection, typing, Cut/Copy/Paste (private clipboard), one-level Undo   }
 {      with Redo, Shift Left/Right, Find and Find & Paste All, Go to Line,     }
 {      named markers, line numbers, the Type Style menu, printing;             }
 {    - all drawing is QuickDraw (DrawText, InvertRect, ScrollRect,             }
 {      EraseRect, MoveTo/Line ...) into the window the Filer lent us.          }
 {                                                                              }
 {  THE "DOCUMENT".  This is a TOOL (InstallTool question 4 answered N): the    }
-{  Filer gives us one window.  The text in it is kept in a data segment       }
-{  ("<tool prefix>work text") whenever the window is set aside, put away or   }
-{  the process is told to terminate, and brought back on the next launch      }
-{  when it holds unsaved work.  The File menu opens, saves and reverts        }
-{  Workshop .TEXT files, including their 1K header page (tabs, type style,    }
+{  Filer gives us one window.  The text in it is kept in a data segment        }
+{  ("<tool prefix>work text") whenever the window is set aside, put away or    }
+{  the process is told to terminate, and brought back on the next launch       }
+{  when it holds unsaved work.  The File menu opens, saves and reverts         }
+{  Workshop .TEXT files, including their 1K header page (tabs, type style,     }
 {  scroll position, selection, markers).                                       }
 {                                                                              }
-{  BUILD:  <LosTextEditorMake  (LosTextEditorMake.text) -- compiles, links,   }
-{  installs the program, its phrase file LosTextEditorAlerts.text and its     }
+{  BUILD:  <LosTextEditorMake  (LosTextEditorMake.text) -- compiles, links,    }
+{  installs the program, its phrase file LosTextEditorAlerts.text and its      }
 {  icon ICON.BIN, and runs InstallTool.                                        }
 {                                                                              }
-{  NOTE ON NAMES: Lisa Pascal only compares the first 8 characters of an       }
-{  identifier, so every identifier here is unique in its first 8 (check with  }
-{  audit_8char.py).                                                            }
 {                                                                              }
 {==============================================================================}
 
@@ -1698,8 +1695,8 @@ begin
    The.Select.Right.Ch := 1;
 end;
 
-{---------------------------- Select ----------------------------}
-procedure Select(Where: Point);
+{---------------------------- EdSelect ----------------------------}
+procedure EdSelect(Where: Point);
 begin
    if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
    if IsInsertion then CaretVis(False);
@@ -1714,8 +1711,8 @@ begin
    Drag(Where);
 end;
 
-{---------------------------- ExtendSelect ----------------------------}
-procedure ExtendSelect(Where: Point);
+{---------------------------- EdExtSel ----------------------------}
+procedure EdExtSel(Where: Point);
 var
    NewPlace: place;
 begin
@@ -1727,8 +1724,8 @@ begin
    Drag(Where);
 end;
 
-{---------------------------- SelectAll ----------------------------}
-procedure SelectAll;
+{---------------------------- EdSelAll ----------------------------}
+procedure EdSelAll;
 begin
    if IsSelection then InvSelection(The.Select.Left, The.Select.Right);
    if IsInsertion then CaretVis(False);
@@ -2999,7 +2996,7 @@ begin
    HideTheBox;
 end;
 
-procedure Find;
+procedure EdFind;
 begin
    if Length(Target) > 0 then begin
       if IsInsertion then CaretVis(False);
@@ -3025,7 +3022,7 @@ begin
    StartCmd(WhichCmd, True);
    Last.Target := PrevTarget;
    Last.Start := The.Select;
-   Find;
+   EdFind;
 end;
 
 procedure UndoFind;
@@ -4398,7 +4395,7 @@ end;
 procedure DoSelAll;
 begin
    StartCmd(CmdSelAll, true);
-   SelectAll;
+   EdSelAll;
    MakeVisible;
 end;
 
@@ -5157,12 +5154,12 @@ begin
                else DownWhere := e.Where;
                if e.ShiftKey then begin
                   targsize := single;
-                  ExtendSelect(DownWhere);
+                  EdExtSel(DownWhere);
                end
                else begin
                   if DownTime >= seltyme then targsize := single  { first click }
                   else if targsize <> beyond then targsize := Succ(targsize); { multi-click }
-                  Select(DownWhere);
+                  EdSelect(DownWhere);
                end;
                RemoveCursor;
                seltyme := Time + ClickDelay;

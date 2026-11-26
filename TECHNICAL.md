@@ -35,7 +35,6 @@ How the Text Editor is built and how the code in `LosTextEditor.text` works. For
 | `ICON.BIN` | The desktop icon (a QuickDraw font, see [§16](#16-the-desktop-icon)). |
 | `icon2_48x32.png` | The icon picture at Lisa size, 48 × 32, black and white. |
 | `png2lisaicon.py` | Converts a 48 × 32 PNG into an icon file such as `ICON.BIN`. |
-| `audit_8char.py` | Checks the program for identifier clashes (see [§3](#3-lisa-pascal-rules-that-matter-here)). |
 | `LisaOsTextFileSpecification.txt` | Apple's definition of a text file, which the editor follows (see [§11](#11-the-text-file-format)). |
 
 The Python tools use only the Python 3 standard library.
@@ -85,9 +84,10 @@ bare RETURN, which the script uses on purpose for "no listing" and "default devi
 ## 3. Lisa Pascal rules that matter here
 
 - **Identifiers are significant to 8 characters**, case-insensitively. `CheckMarks` and the Menus
-  unit's `CheckMark` are the *same* identifier. Run `python3 audit_8char.py` after every change: it
-  compares every program-level name against each other and against the interfaces of the 18 units in
-  the `uses` list (read from the Computer History Museum Lisa sources).
+  unit's `CheckMark` are the *same* identifier. Run
+  `python3 ../LisaPascalCrossCompiler/pascal/audit_8char.py LosTextEditor.text` after every change:
+  it compares every program-level name against each other, against the interfaces of the 18 units in
+  the `uses` list (read from `boot-workshop3.0`), and against exported library entry points.
 - **A `var` parameter needs exactly the declared type.** Two separately declared `string[255]` types
   are different types; therefore `FileStr = str` is declared as an alias of `str`.
 - **4-digit hex constants are 16-bit integers**: `$8000` is −32768. Long constants are written with 8
@@ -111,7 +111,7 @@ declarations remain). In order:
 | Heap growth (`LTEErr`), callbacks | `GrowHeap`/`StoreError`, `OutOfHeapSpace`, `AlertFailed`, `LastWishes` |
 | Dialog bar (`LTEDlg`) | `ReadCh`, `GetReply`, `DrawTheBox`, `Confirm`, `Error`, `Warning`, `GetNumber` |
 | Pages, geometry, display | `NewPage`, `FreeUp`, `FindLine`, `GenLine`, `FindChar`, `FindPoint`, `Repaint`, scrolling, caret, selection highlighting, status line, title, line-number margin |
-| Selection | `Select`, `Drag`, `ExtendSelect`, `SelectAll` |
+| Selection | `EdSelect`, `Drag`, `EdExtSel`, `EdSelAll` |
 | Editing (`LTEEdit`) | marker bookkeeping, `Cut`, `Copie`, `Deletion`, `Paste`, `Insertion`, Shift Left/Right |
 | Fonts (`LTEMisc`) | `OpenMainFont`, `FamilyOf`, `StyleOf`, `ChangeFont` |
 | Search, Go to, markers (`LTESrch`) | `FindNext`, `DoFind`, `DoFindAll`, `DoGoTo`, `SetMarker`, `GoToMarker` … |
@@ -418,7 +418,8 @@ location table and the offset/width table; padded to 1024 bytes. 1 bits are blac
 
 ## 17. Checking and verifying changes
 
-- `python3 audit_8char.py` — run after every change to the program (see §3).
+- `python3 ../LisaPascalCrossCompiler/pascal/audit_8char.py LosTextEditor.text` — run after every
+  change to the program (see §3).
 - The interfaces of all units used are in the Computer History Museum release of the Lisa sources
   (`LISA_OS/LIBS/…`; the Filer is `APPS/APDM`). Check new library calls there.
 - In LisaEm, displayed screenshots are stretched vertically (364 → 500 rows), so one-pixel lines can
