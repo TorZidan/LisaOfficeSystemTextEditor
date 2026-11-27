@@ -116,5 +116,5 @@ echo "installing {T197000} onto $DC42_IMAGE"
   python3 "$FS_TOOLS/LisaFileSystemToolPerFile.py" put "$DC42_IMAGE" "$BUILD_DIR/LosTextEditorIcon.BIN" '{T197000}ICON'
   python3 "$LISA_PASCAL/installtool/installtool.py" --fs-tool "$FS_TOOLS" \
     --image "$DC42_IMAGE" Y '' 197000 N N 'Text Editor'
-} > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed on $DC42_IMAGE (see $BUILD_DIR/installtool.log)"; }
+} < /dev/null > "$BUILD_DIR/installtool.log" 2>&1 || { cat "$BUILD_DIR/installtool.log"; die "installtool failed on $DC42_IMAGE (see $BUILD_DIR/installtool.log)"; }
 echo "  $(grep 'successfully installed' "$BUILD_DIR/installtool.log")"
